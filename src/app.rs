@@ -33,7 +33,8 @@ enum View {
 enum Msg {
     Scan(Vec<Device>, HashMap<String, grpc::Endpoint>),
     Status(String),
-    ScreenSize(String, (u32, u32)),
+    /// `None` when `wm size` failed; it is asked again.
+    ScreenSize(String, Option<(u32, u32)>),
 }
 
 /// Things the user asked for while the UI was being drawn.
@@ -88,6 +89,10 @@ pub struct EmuGrid {
     gestures: input::GestureTracker,
     /// Tab presses taken from egui, to send to the focused device.
     pending_tabs: usize,
+    /// A live finger held down on a device: serial and last device position.
+    finger: Option<(String, (u32, u32))>,
+    /// Serials with a `wm size` lookup in flight.
+    size_pending: HashSet<String>,
 }
 
 impl EmuGrid {
@@ -99,8 +104,12 @@ impl EmuGrid {
         let (input_tx, input_rx) = mpsc::channel::<(String, String)>();
         let input_sdk = sdk.clone();
         thread::spawn(move || {
-            for (serial, cmd) in input_rx {
-                let _ = devices::shell(&input_sdk, &serial, &cmd);
+            let mut queue = std::collections::VecDeque::new();
+            while let Ok(first) = input_rx.recv() {
+                queue.push_back(first);
+                while let Some((serial, cmd)) = input::next_command(&mut queue, &input_rx) {
+                    let _ = devices::shell(&input_sdk, &serial, &cmd);
+                }
             }
         });
 
@@ -123,6 +132,8 @@ impl EmuGrid {
             scroll: (0.0, None),
             gestures: input::GestureTracker::default(),
             pending_tabs: 0,
+            size_pending: HashSet::new(),
+            finger: None,
         }
     }
 
@@ -184,6 +195,52 @@ impl EmuGrid {
         }
     }
 
+    /// Look up an Android device's real screen size (for mapping taps) until
+    /// it is known. Failed lookups are retried after a pause.
+    fn ensure_screen_size(&mut self, ctx: &egui::Context, serial: &str) {
+        if self.screen_sizes.contains_key(serial) || !self.size_pending.insert(serial.into()) {
+            return;
+        }
+        let (sdk, tx, s, ctx) = (
+            self.sdk.clone(),
+            self.tx.clone(),
+            serial.to_string(),
+            ctx.clone(),
+        );
+        thread::spawn(move || {
+            let size = devices::shell(&sdk, &s, "wm size")
+                .ok()
+                .and_then(|o| input::parse_wm_size(&o));
+            if size.is_none() {
+                thread::sleep(Duration::from_secs(2));
+            }
+            let _ = tx.send(Msg::ScreenSize(s, size));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Never leave a finger pressed on a device we stop looking at.
+    fn lift_finger(&mut self) {
+        self.gestures = input::GestureTracker::default();
+        if let Some((serial, (x, y))) = self.finger.take() {
+            let _ = self
+                .input_tx
+                .send((serial, format!("input motionevent CANCEL {x} {y}")));
+        }
+    }
+
+    /// Name shown for a device; emulators often share a model name, so add
+    /// the serial when the name alone is ambiguous.
+    fn label(&self, d: &Device) -> String {
+        let same = self.running().filter(|o| o.name == d.name).count();
+        match d.serial() {
+            Some(serial) if same > 1 && d.platform == Platform::Android => {
+                format!("{} · {serial}", d.name)
+            }
+            _ => d.name.clone(),
+        }
+    }
+
     fn running(&self) -> impl Iterator<Item = &Device> {
         self.devices.iter().filter(|d| d.serial().is_some())
     }
@@ -195,25 +252,18 @@ impl EmuGrid {
     fn apply(&mut self, ctx: &egui::Context, action: Action) {
         match action {
             Action::Focus(serial) => {
-                let android = self
-                    .device(&serial)
-                    .is_some_and(|d| d.platform == Platform::Android);
-                if android && !self.screen_sizes.contains_key(&serial) {
-                    let (sdk, tx, s) = (self.sdk.clone(), self.tx.clone(), serial.clone());
-                    thread::spawn(move || {
-                        if let Some(size) = devices::shell(&sdk, &s, "wm size")
-                            .ok()
-                            .and_then(|o| input::parse_wm_size(&o))
-                        {
-                            let _ = tx.send(Msg::ScreenSize(s, size));
-                        }
-                    });
-                }
+                self.lift_finger();
+                self.scroll = (0.0, None);
+                self.gestures = input::GestureTracker::default();
                 self.focused = Some(serial);
                 self.view = View::Grid;
             }
-            Action::Unfocus => self.focused = None,
+            Action::Unfocus => {
+                self.lift_finger();
+                self.focused = None;
+            }
             Action::View(v) => {
+                self.lift_finger();
                 self.view = v;
                 self.focused = None;
             }
@@ -381,7 +431,7 @@ impl EmuGrid {
         painter.text(
             rect.left_top() + Vec2::new(10.0, 8.0),
             Align2::LEFT_TOP,
-            &d.name,
+            self.label(d),
             FontId::proportional(13.0),
             text,
         );
@@ -405,7 +455,7 @@ impl EmuGrid {
         painter.text(
             Pos2::new(rect.left() + 10.0, rect.bottom() - 10.0),
             Align2::LEFT_CENTER,
-            format!("● {label}"),
+            format!("⚫ {label}"),
             FontId::proportional(11.0),
             color,
         );
@@ -467,34 +517,58 @@ impl EmuGrid {
             return;
         };
         let android = d.platform == Platform::Android;
+        if android {
+            self.ensure_screen_size(ui.ctx(), serial);
+        }
         let shell = |cmd: &str| Action::Shell(serial.to_string(), cmd.to_string());
 
         ui.horizontal_wrapped(|ui| {
-            if ui.button("← Grid").on_hover_text("Esc").clicked() {
+            if ui.button("⬅ Grid").on_hover_text("Esc").clicked() {
                 actions.push(Action::Unfocus);
             }
-            ui.strong(&d.name);
+            let current = self.label(&d);
+            let others: Vec<(String, String)> = self
+                .running()
+                .filter_map(|o| Some((o.serial()?.to_string(), self.label(o))))
+                .collect();
+            egui::ComboBox::from_id_salt("device-switch")
+                .selected_text(egui::RichText::new(current).strong())
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    for (s, name) in others {
+                        if ui.selectable_label(s == serial, name).clicked() && s != serial {
+                            actions.push(Action::Focus(s));
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Switch device");
             let live = self
                 .capture
                 .control(serial)
                 .map(|c| c.live.load(Ordering::Relaxed));
             let (label, color) = status_badge(&d, live);
-            ui.colored_label(color, format!("● {label}"));
+            ui.colored_label(color, format!("⚫ {label}"));
             ui.separator();
             if android {
                 for (label, key, tip) in [
-                    ("◀", 4, "Back"),
-                    ("⌂", 3, "Home"),
-                    ("▣", 187, "Recent apps"),
-                    ("−", 25, "Volume down"),
-                    ("+", 24, "Volume up"),
-                    ("⏻", 26, "Power"),
+                    ("◀ Back", 4, "Back"),
+                    ("🏠 Home", 3, "Home"),
+                    ("▣ Recents", 187, "Recent apps"),
+                    ("🔉", 25, "Volume down"),
+                    ("🔊", 24, "Volume up"),
+                    ("⚡ Power", 26, "Power button"),
                 ] {
                     if ui.button(label).on_hover_text(tip).clicked() {
                         actions.push(shell(&format!("input keyevent {key}")));
                     }
                 }
-                if d.is_emulator && ui.button("⟳").on_hover_text("Rotate").clicked() {
+                if d.is_emulator
+                    && ui
+                        .button("⟳ Rotate")
+                        .on_hover_text("Rotate the emulator")
+                        .clicked()
+                {
                     actions.push(Action::Rotate(serial.to_string()));
                 }
             } else if let Some(udid) = &d.udid
@@ -503,7 +577,7 @@ impl EmuGrid {
                 actions.push(Action::IosOpen(udid.clone()));
             }
             if ui
-                .button("📷")
+                .button("📷 Screenshot")
                 .on_hover_text("Save screenshot to Desktop")
                 .clicked()
             {
@@ -537,7 +611,7 @@ impl EmuGrid {
         }
         ui.vertical_centered(|ui| {
             ui.small(if android {
-                "click = tap · drag = swipe · right-click = long press · type to send keys · Esc = back"
+                "click = tap · drag = swipe · hold = long press, then drag to move · type to send keys · Esc = back"
             } else {
                 "View only — use “Open in Simulator” to interact"
             });
@@ -572,9 +646,24 @@ impl EmuGrid {
                 let ((x1, y1), (x2, y2)) = (to_dev(a), to_dev(b));
                 actions.push(shell(&format!("input swipe {x1} {y1} {x2} {y2} {ms}")));
             }
+            Some(input::Gesture::Down(p)) if img.contains(p) => {
+                let (x, y) = to_dev(p);
+                self.finger = Some((serial.to_string(), (x, y)));
+                actions.push(shell(&format!("input motionevent DOWN {x} {y}")));
+            }
+            Some(input::Gesture::Move(p)) if self.finger.is_some() => {
+                let (x, y) = to_dev(p);
+                self.finger = Some((serial.to_string(), (x, y)));
+                actions.push(shell(&format!("input motionevent MOVE {x} {y}")));
+            }
+            Some(input::Gesture::Up(p)) if self.finger.is_some() => {
+                let (x, y) = to_dev(p);
+                self.finger = None;
+                actions.push(shell(&format!("input motionevent UP {x} {y}")));
+            }
             _ => {}
         }
-        // Scroll wheel / trackpad → one swipe once the gesture settles.
+        // Scroll wheel / trackpad -> one swipe once the gesture settles.
         if resp.hovered() {
             let delta: f32 = ctx.input(|i| {
                 i.raw
@@ -613,7 +702,7 @@ impl EmuGrid {
         }
     }
 
-    /// Keyboard → device, while a device is focused.
+    /// Keyboard -> device, while a device is focused.
     fn forward_keys(&mut self, ctx: &egui::Context, serial: &str, actions: &mut Vec<Action>) {
         let tabs = std::mem::take(&mut self.pending_tabs);
         if ctx.text_edit_focused() {
@@ -728,8 +817,8 @@ fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             let (dot, color) = match &d.state {
-                State::Running { .. } => ("●", GREEN),
-                State::Other { .. } => ("●", AMBER),
+                State::Running { .. } => ("⚫", GREEN),
+                State::Other { .. } => ("⚫", AMBER),
                 State::Stopped => ("○", ui.visuals().weak_text_color()),
             };
             ui.colored_label(color, dot);
@@ -757,7 +846,7 @@ fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
                 |ui| match (&d.state, d.platform) {
                     (State::Stopped, Platform::Android) => {
                         if let Some(avd) = &d.avd {
-                            ui.menu_button("⋯", |ui| {
+                            ui.menu_button("…", |ui| {
                                 if ui.button("Cold boot").clicked() {
                                     actions.push(Action::Start(avd.clone(), Boot::Cold));
                                 }
@@ -833,7 +922,10 @@ impl eframe::App for EmuGrid {
                     self.last_scan = None;
                 }
                 Msg::ScreenSize(serial, size) => {
-                    self.screen_sizes.insert(serial, size);
+                    self.size_pending.remove(&serial);
+                    if let Some(size) = size {
+                        self.screen_sizes.insert(serial, size);
+                    }
                 }
             }
         }
@@ -878,7 +970,7 @@ impl eframe::App for EmuGrid {
                 ui.heading("emugrid");
                 ui.add_space(8.0);
                 let grid_on = self.view == View::Grid;
-                if ui.selectable_label(grid_on, "▦ Grid").clicked() {
+                if ui.selectable_label(grid_on, "⊞ Grid").clicked() {
                     actions.push(Action::View(View::Grid));
                 }
                 if ui.selectable_label(!grid_on, "☰ List").clicked() {
@@ -980,5 +1072,104 @@ mod tests {
             .insert("emulator-5554".into(), (1080, 2400));
         app.on_scan(Vec::new(), HashMap::new());
         assert!(app.screen_sizes.is_empty());
+    }
+
+    /// Every non-ASCII character in the UI's text must exist in the bundled
+    /// fonts, or it draws as an empty box.
+    #[test]
+    fn ui_symbols_have_glyphs() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(Default::default(), |_| {});
+        out.textures_delta.clear();
+        let source = include_str!("app.rs");
+        let mut chars: Vec<char> = source.chars().filter(|c| !c.is_ascii()).collect();
+        chars.sort();
+        chars.dedup();
+        let missing: Vec<char> = ctx.fonts_mut(|f| {
+            chars
+                .into_iter()
+                .filter(|&c| !f.has_glyph(&FontId::proportional(14.0), c))
+                .collect()
+        });
+        assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
+
+    /// Clicking the middle of the focused screen sends a tap there.
+    #[test]
+    fn click_on_focused_screen_sends_tap() {
+        use egui::{Event, PointerButton, RawInput};
+        let ctx = egui::Context::default();
+        let mut app = EmuGrid::new(&ctx);
+        app.devices = vec![Device {
+            name: "phone".into(),
+            platform: Platform::Android,
+            is_emulator: true,
+            state: State::Running {
+                serial: "emulator-5554".into(),
+            },
+            avd: None,
+            runtime: None,
+            udid: None,
+        }];
+        let tex = ctx.load_texture(
+            "s",
+            egui::ColorImage::from_rgb([108, 240], &vec![0; 108 * 240 * 3]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.screens.insert(
+            "emulator-5554".into(),
+            Screen {
+                tex,
+                size: [108, 240],
+            },
+        );
+        app.screen_sizes
+            .insert("emulator-5554".into(), (1080, 2400));
+        app.focused = Some("emulator-5554".into());
+
+        let center = Pos2::new(400.0, 330.0);
+        let steps: Vec<(f64, Vec<Event>)> = vec![
+            (0.0, vec![Event::PointerMoved(center)]),
+            (
+                0.1,
+                vec![Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                }],
+            ),
+            (
+                0.2,
+                vec![Event::PointerButton {
+                    pos: center,
+                    button: PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+            ),
+            (0.3, vec![]),
+        ];
+        let mut sent = Vec::new();
+        for (t, events) in steps {
+            let raw = RawInput {
+                time: Some(t),
+                events,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let mut actions = Vec::new();
+                app.focused_view(ui, "emulator-5554", &mut actions);
+                for a in actions {
+                    if let Action::Shell(_, cmd) = a {
+                        sent.push(cmd);
+                    }
+                }
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("input tap "), "{sent:?}");
     }
 }

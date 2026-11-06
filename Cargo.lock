@@ -543,6 +543,7 @@ version = "0.2.0"
 dependencies = [
  "bytes",
  "eframe",
+ "egui",
  "h2",
  "http",
  "png",
