@@ -1,7 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod capture;
 mod devices;
+mod grid;
+mod input;
+mod ios;
 mod sdk;
 
 fn main() -> eframe::Result {
