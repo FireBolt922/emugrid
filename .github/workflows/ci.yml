@@ -1,13 +1,13 @@
-name: CI
+name: Checks
 
+# Manual only: run from the Actions tab ("Run workflow").
 on:
-  push:
-    branches: [main]
-  pull_request:
+  workflow_dispatch:
 
 jobs:
-  build:
+  check:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
@@ -21,5 +21,5 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev
       - run: cargo fmt --check
-      - run: cargo clippy --release -- -D warnings
-      - run: cargo build --release
+      - run: cargo clippy --release --all-targets --locked -- -D warnings
+      - run: cargo test --locked

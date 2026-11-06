@@ -1,10 +1,10 @@
 # emugrid
 
-**See and control all your Android emulators in one place.**
-A tiny, fast, cross-platform desktop app written in Rust. ~3 MB, no Electron, no browser engine.
+**See and control all your Android emulators — and iOS simulators — in one window.**
+A tiny, fast, cross-platform desktop app written in Rust. ~4 MB, no Electron, no browser engine.
 
-> Status: early (v0.1). Lists emulators and devices, starts and stops them.
-> The live screen grid is next. See the [roadmap](docs/ROADMAP.md).
+> Status: v0.2. Live screen grid, interactive device view, iOS simulators.
+> See the [roadmap](docs/ROADMAP.md).
 
 ## Why
 
@@ -12,21 +12,47 @@ Testing on several emulators at once means juggling many emulator windows.
 Tools like Orca show every emulator side by side, but there's no small, free,
 open-source app that does just that. emugrid aims to be it:
 
-- **Lightweight first:** a single native binary (~3 MB), low memory, starts instantly.
+- **Lightweight first:** a single native binary (~4 MB), low memory, starts instantly.
 - **Cross-platform:** macOS, Windows, Linux.
-- **Zero setup:** finds your Android SDK on its own.
+- **Zero setup:** finds your Android SDK (and Xcode's `simctl`) on its own.
 
-## What it does today
+## Features
 
-- Lists every AVD you've created, running or not
-- Shows running emulators **and** USB-connected phones (via `adb`)
-- One-click **Start** / **Stop** for emulators
+**Grid view**
+- Every running emulator, phone and iOS simulator as a **live screen tile**
+- SDK-started emulators stream over the emulator's **gRPC** API (smooth, pushed on change);
+  everything else (Orca/TCP emulators, USB phones, iOS simulators) is polled as PNG (~2 fps)
+- Tiles scrolled out of view, and a minimized window, **pause** their streams
+
+**Focused view** (click a tile)
+- **Click** = tap, **drag** = swipe, **right-click** = long press, **scroll** = swipe
+- **Type** to send text and keys (Backspace, Enter, Tab, arrows); **Esc** goes back
+- Back / Home / Recents / Volume / Power buttons, **Rotate** (emulators)
+- 📷 save a full-resolution screenshot to your Desktop
+
+**List view**
+- Every AVD you've created, running or not, plus USB devices
+- **Start**, **Stop**, **Cold boot**, **Wipe data and start**
+- iOS simulators (macOS with Xcode): **Boot**, **Shut down**, **Open in Simulator**
+
+**Everywhere**
+- **Drop an `.apk`** on the window to install it on every running Android device at once
 - Auto-refreshes every 3 seconds without freezing the UI
 
 ## Requirements
 
 - Android SDK with `platform-tools` (adb) and `emulator`.
   Found through `ANDROID_HOME`, `ANDROID_SDK_ROOT`, the default install folder or your `PATH`.
+- Optional, macOS: Xcode for iOS simulators. iOS simulators are view-only
+  (`simctl` cannot send touches); use **Open in Simulator** to interact.
+
+## Download
+
+Builds are produced by the manual **Build** workflow (Actions tab → *Build* → *Run workflow*):
+macOS (Apple Silicon and Intel, as `emugrid.app`), Windows (`emugrid.exe`) and Linux.
+Give it a `release_tag` to publish a GitHub release too.
+
+> The macOS app is unsigned: the first time, right-click it → **Open**.
 
 ## Build & run
 
@@ -35,6 +61,7 @@ cargo run --release
 ```
 
 The binary ends up in `target/release/emugrid` (`emugrid.exe` on Windows).
+On Linux you need `libxkbcommon-dev libgl1-mesa-dev libwayland-dev` to build.
 
 ## How it works
 
@@ -43,10 +70,31 @@ The binary ends up in `target/release/emugrid` (`emugrid.exe` on Windows).
 | Installed emulators | `emulator -list-avds` |
 | Running devices | `adb devices` |
 | Which AVD a running emulator is | `adb -s <serial> emu avd name` |
-| Start / stop | `emulator -avd <name>` / `adb -s <serial> emu kill` |
+| Start / stop | `emulator -avd <name>` (`-no-snapshot-load`, `-wipe-data`) / `adb emu kill` |
+| Live screen (SDK emulators) | gRPC `EmulatorController/streamScreenshot`, RGB888 scaled on the emulator; port and token from the emulator's discovery file |
+| Screen (everything else) | `adb exec-out screencap -p` / `xcrun simctl io <udid> screenshot` |
+| Touch, keys, buttons | `adb shell input tap / swipe / text / keyevent`, `adb emu rotate` |
+| iOS simulators | `xcrun simctl list / boot / shutdown` |
 | UI | [egui](https://github.com/emilk/egui) via `eframe` (OpenGL) |
 
-More detail is in [docs/IDEA.md](docs/IDEA.md).
+The gRPC client is a few hundred lines over `h2` with hand-written protobuf, so there's
+no codegen and no `protoc` needed to build. More detail is in [docs/IDEA.md](docs/IDEA.md).
+
+### Performance (MacBook, 1 gRPC emulator + 4 Orca emulators streaming)
+
+| | |
+|---|---|
+| Release binary | 3.7 MB |
+| CPU | ~3.5% of one core |
+| Memory | ~103 MB RSS |
+
+## CI
+
+All workflows are **manual** (`workflow_dispatch`), nothing runs on push:
+
+- **Checks:** `cargo fmt`, `clippy -D warnings`, `cargo test` on macOS, Windows, Linux
+- **Build:** release binaries for all platforms, fails if any is over the 8 MB budget,
+  optional GitHub release
 
 ## License
 

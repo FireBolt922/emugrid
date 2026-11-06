@@ -1,0 +1,110 @@
+name: Build
+
+# Manual only: run from the Actions tab ("Run workflow").
+# Produces downloadable binaries for macOS (Apple Silicon + Intel), Windows and Linux.
+# Fill in "release_tag" to also publish them as a GitHub release.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Optional: publish a GitHub release with this tag (e.g. v0.2.0). Empty = artifacts only."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  # Lightweight is the point of emugrid: fail if the binary grows past this.
+  MAX_BINARY_BYTES: 8388608
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin, exe: emugrid }
+          - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin, exe: emugrid }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: emugrid.exe }
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: emugrid }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Linux GUI deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Size budget
+        run: |
+          bin="target/${{ matrix.target }}/release/${{ matrix.exe }}"
+          size=$(wc -c < "$bin" | tr -d ' ')
+          echo "### ${{ matrix.name }}: $((size / 1024)) KiB" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$size" -gt "$MAX_BINARY_BYTES" ]; then
+            echo "::error::Binary is $size bytes, over the $MAX_BINARY_BYTES byte budget"
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          bin="target/${{ matrix.target }}/release/${{ matrix.exe }}"
+          name="emugrid-${{ matrix.name }}"
+          mkdir -p dist
+          case "${{ runner.os }}" in
+            macOS)
+              app="dist/emugrid.app/Contents"
+              mkdir -p "$app/MacOS"
+              cp "$bin" "$app/MacOS/emugrid"
+              sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
+              (cd dist && ditto -c -k --keepParent emugrid.app "$name.zip" && rm -rf emugrid.app)
+              ;;
+            Windows)
+              cp "$bin" dist/
+              (cd dist && 7z a -tzip "$name.zip" emugrid.exe >/dev/null && rm emugrid.exe)
+              ;;
+            Linux)
+              cp "$bin" dist/
+              (cd dist && tar czf "$name.tar.gz" emugrid && rm emugrid)
+              ;;
+          esac
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emugrid-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    if: inputs.release_tag != ''
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "emugrid $TAG" \
+            --generate-notes
