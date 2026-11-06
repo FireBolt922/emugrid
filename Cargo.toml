@@ -1,0 +1,20 @@
+[package]
+name = "emugrid"
+version = "0.1.0"
+edition = "2024"
+description = "A tiny, cross-platform dashboard to see and control all your Android emulators in one place."
+license = "MIT"
+readme = "README.md"
+keywords = ["android", "emulator", "adb", "avd", "devtools"]
+categories = ["development-tools"]
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
+# Keep the shipped binary small: this is the project's main goal.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
