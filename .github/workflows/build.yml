@@ -12,7 +12,7 @@ on:
         default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   # Lightweight is the point of emugrid: fail if the binary grows past this.
@@ -70,6 +70,8 @@ jobs:
               mkdir -p "$app/MacOS"
               cp "$bin" "$app/MacOS/emugrid"
               sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
+              # Ad-hoc signature so Gatekeeper treats it as unidentified, not "damaged".
+              codesign --force --deep --sign - dist/emugrid.app
               (cd dist && ditto -c -k --keepParent emugrid.app "$name.zip" && rm -rf emugrid.app)
               ;;
             Windows)
@@ -93,6 +95,8 @@ jobs:
     if: inputs.release_tag != ''
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:

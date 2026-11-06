@@ -9,9 +9,8 @@ use crate::sdk;
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,6 +41,9 @@ pub struct Control {
     pub live: AtomicBool,
     /// Frames delivered so far.
     pub frames: AtomicU64,
+    /// Only the newest frame is kept, so a UI that isn't drawing can't
+    /// make frames pile up.
+    latest: Mutex<Option<Frame>>,
 }
 
 impl Control {
@@ -53,7 +55,19 @@ impl Control {
             max_fps: AtomicU32::new(TILE_FPS),
             live: AtomicBool::new(false),
             frames: AtomicU64::new(0),
+            latest: Mutex::new(None),
         }
+    }
+
+    pub fn publish(&self, frame: Frame) {
+        self.frames.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut slot) = self.latest.lock() {
+            *slot = Some(frame);
+        }
+    }
+
+    pub fn take_frame(&self) -> Option<Frame> {
+        self.latest.lock().ok()?.take()
     }
 }
 
@@ -71,18 +85,13 @@ pub enum Source {
 /// Owns one worker thread per streamed device.
 pub struct Manager {
     workers: HashMap<String, Arc<Control>>,
-    tx: Sender<(String, Frame)>,
-    rx: Receiver<(String, Frame)>,
     ctx: egui::Context,
 }
 
 impl Manager {
     pub fn new(ctx: egui::Context) -> Self {
-        let (tx, rx) = mpsc::channel();
         Self {
             workers: HashMap::new(),
-            tx,
-            rx,
             ctx,
         }
     }
@@ -104,11 +113,10 @@ impl Manager {
             let control = Arc::new(Control::new(320));
             control.active.store(false, Ordering::Relaxed);
             self.workers.insert(id.clone(), control.clone());
-            let (tx, ctx) = (self.tx.clone(), self.ctx.clone());
+            let ctx = self.ctx.clone();
             thread::spawn(move || {
                 let send = |f: Frame| {
-                    control.frames.fetch_add(1, Ordering::Relaxed);
-                    let _ = tx.send((id.clone(), f));
+                    control.publish(f);
                     ctx.request_repaint();
                 };
                 run(&id, source, &control, send);
@@ -124,9 +132,11 @@ impl Manager {
         self.workers.iter()
     }
 
-    /// Frames that arrived since the last call.
+    /// The newest frame per device that arrived since the last call.
     pub fn frames(&self) -> impl Iterator<Item = (String, Frame)> + '_ {
-        self.rx.try_iter()
+        self.workers
+            .iter()
+            .filter_map(|(id, c)| Some((id.clone(), c.take_frame()?)))
     }
 }
 
@@ -138,16 +148,22 @@ impl Drop for Manager {
     }
 }
 
+/// After falling back to PNG, try gRPC again this often (emulator restarted,
+/// discovery file appeared, transient error).
+const GRPC_RETRY: Duration = Duration::from_secs(30);
+
 fn run(id: &str, source: Source, control: &Control, send: impl Fn(Frame)) {
     match source {
-        Source::Grpc { ep, adb } => {
+        Source::Grpc { ep, adb } => loop {
             let mut failures = 0;
-            while !control.stop.load(Ordering::Relaxed) && failures < 3 {
+            while failures < 3 {
                 if !wait_until_active(control) {
                     return;
                 }
+                // Re-read the discovery file each time: port and token change
+                // when the emulator restarts.
+                let ep = grpc::discover().remove(id).unwrap_or_else(|| ep.clone());
                 let before = control.frames.load(Ordering::Relaxed);
-                control.live.store(true, Ordering::Relaxed);
                 let result = grpc::stream(&ep, control, &send);
                 if control.frames.load(Ordering::Relaxed) > before {
                     failures = 0;
@@ -158,10 +174,16 @@ fn run(id: &str, source: Source, control: &Control, send: impl Fn(Frame)) {
                 }
             }
             control.live.store(false, Ordering::Relaxed);
-            poll(control, &send, || adb_screencap(&adb, id));
+            if !poll(control, &send, || adb_screencap(&adb, id), Some(GRPC_RETRY)) {
+                return;
+            }
+        },
+        Source::Adb { adb } => {
+            poll(control, &send, || adb_screencap(&adb, id), None);
         }
-        Source::Adb { adb } => poll(control, &send, || adb_screencap(&adb, id)),
-        Source::Simctl => poll(control, &send, || simctl_screenshot(id)),
+        Source::Simctl => {
+            poll(control, &send, || simctl_screenshot(id), None);
+        }
     }
 }
 
@@ -176,9 +198,20 @@ fn wait_until_active(control: &Control) -> bool {
     !control.stop.load(Ordering::Relaxed)
 }
 
-fn poll(control: &Control, send: &impl Fn(Frame), capture: impl Fn() -> Option<Vec<u8>>) {
+/// Poll PNG screenshots. Returns true when `limit` ran out, false when the
+/// worker should exit.
+fn poll(
+    control: &Control,
+    send: &impl Fn(Frame),
+    capture: impl Fn() -> Option<Vec<u8>>,
+    limit: Option<Duration>,
+) -> bool {
     let gap = Duration::from_secs(1) / PNG_FPS;
+    let begun = Instant::now();
     while wait_until_active(control) {
+        if limit.is_some_and(|l| begun.elapsed() >= l) {
+            return true;
+        }
         let started = Instant::now();
         match capture().and_then(|b| png::decode(&b)) {
             Some(f) => send(png::downscale(f, control.size.load(Ordering::Relaxed))),
@@ -186,6 +219,7 @@ fn poll(control: &Control, send: &impl Fn(Frame), capture: impl Fn() -> Option<V
         }
         thread::sleep(gap.saturating_sub(started.elapsed()));
     }
+    false
 }
 
 fn adb_screencap(adb: &std::path::Path, serial: &str) -> Option<Vec<u8>> {
@@ -208,4 +242,29 @@ fn simctl_screenshot(udid: &str) -> Option<Vec<u8>> {
     let bytes = ok.then(|| std::fs::read(&path).ok()).flatten();
     let _ = std::fs::remove_file(&path);
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(n: u8) -> Frame {
+        Frame {
+            width: 1,
+            height: 1,
+            rgb: vec![n; 3],
+        }
+    }
+
+    /// A UI that stops reading (hidden window) must not let frames pile up.
+    #[test]
+    fn only_the_latest_frame_is_kept() {
+        let c = Control::new(320);
+        for n in 0..100 {
+            c.publish(frame(n));
+        }
+        assert_eq!(c.frames.load(Ordering::Relaxed), 100);
+        assert_eq!(c.take_frame().map(|f| f.rgb[0]), Some(99));
+        assert!(c.take_frame().is_none());
+    }
 }

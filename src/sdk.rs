@@ -19,7 +19,15 @@ impl Sdk {
         Self {
             adb: find_tool(&roots, "platform-tools", "adb"),
             emulator: find_tool(&roots, "emulator", "emulator"),
+            // `xcrun` is a stub that pops an "install developer tools" dialog
+            // when none are installed, so ask `xcode-select` (silent) first.
             simctl: cfg!(target_os = "macos")
+                && command("xcode-select")
+                    .arg("-p")
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success())
                 && command("xcrun")
                     .args(["--find", "simctl"])
                     .stdout(Stdio::null())

@@ -39,9 +39,15 @@ pub fn parse_discovery(text: &str) -> Option<Endpoint> {
 
 /// Every running emulator that exposes gRPC, keyed by adb serial.
 pub fn discover() -> HashMap<String, Endpoint> {
-    let mut found = HashMap::new();
-    for dir in discovery_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    discover_in(&discovery_dirs())
+}
+
+/// Like `discover`, over given folders. When several files name the same
+/// emulator (leftovers from a crash), the most recently written one wins.
+pub fn discover_in(dirs: &[PathBuf]) -> HashMap<String, Endpoint> {
+    let mut found: HashMap<String, (std::time::SystemTime, Endpoint)> = HashMap::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -50,15 +56,23 @@ pub fn discover() -> HashMap<String, Endpoint> {
             if !is_ini {
                 continue;
             }
-            if let Some(ep) = std::fs::read_to_string(&path)
+            let Some(ep) = std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|t| parse_discovery(&t))
-            {
-                found.insert(ep.serial(), ep);
+            else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let newer = found.get(&ep.serial()).is_none_or(|(t, _)| modified > *t);
+            if newer {
+                found.insert(ep.serial(), (modified, ep));
             }
         }
     }
-    found
+    found.into_iter().map(|(k, (_, ep))| (k, ep)).collect()
 }
 
 /// Where the emulator writes its discovery files on each OS.
@@ -95,11 +109,13 @@ pub fn stream(ep: &Endpoint, control: &Control, mut send: impl FnMut(Frame)) -> 
     rt.block_on(stream_async(ep, control, &mut send))
 }
 
-async fn stream_async(
-    ep: &Endpoint,
-    control: &Control,
-    send: &mut impl FnMut(Frame),
-) -> Result<(), String> {
+/// How long connecting and getting response headers may take.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+type Opened = (h2::client::SendRequest<bytes::Bytes>, h2::RecvStream);
+
+/// Connect, send the `streamScreenshot` request and wait for its headers.
+async fn open(ep: &Endpoint, size: u32) -> Result<Opened, String> {
     let err = |e: &dyn std::fmt::Display| e.to_string();
     let tcp = tokio::net::TcpStream::connect(("127.0.0.1", ep.grpc_port))
         .await
@@ -117,7 +133,6 @@ async fn stream_async(
     });
     let mut client = client.ready().await.map_err(|e| err(&e))?;
 
-    let size = control.size.load(Ordering::Relaxed);
     let mut req = http::Request::builder()
         .method("POST")
         .uri(format!(
@@ -147,7 +162,21 @@ async fn stream_async(
             .unwrap_or("");
         return Err(format!("grpc-status {status:?} {message}"));
     }
-    let mut body = resp.into_body();
+    Ok((client, resp.into_body()))
+}
+
+async fn stream_async(
+    ep: &Endpoint,
+    control: &Control,
+    send: &mut impl FnMut(Frame),
+) -> Result<(), String> {
+    let err = |e: &dyn std::fmt::Display| e.to_string();
+    let size = control.size.load(Ordering::Relaxed);
+    // An emulator that is paused, or a stale port held by something else,
+    // must not hang the worker.
+    let (_client, mut body) = tokio::time::timeout(SETUP_TIMEOUT, open(ep, size))
+        .await
+        .map_err(|_| "timed out connecting".to_string())??;
     let mut reader = FrameReader::default();
     let mut last_sent: Option<Instant> = None;
     // The emulator only pushes when the screen changes, so a frame skipped by
@@ -187,6 +216,7 @@ async fn stream_async(
             && img.pixels.len() == (img.width * img.height * 3) as usize
         {
             last_sent = Some(Instant::now());
+            control.live.store(true, Ordering::Relaxed);
             send(Frame {
                 width: img.width,
                 height: img.height,
@@ -224,6 +254,59 @@ mod tests {
         let ep = parse_discovery("port.serial=5556\r\ngrpc.port=8556\r\n").unwrap();
         assert_eq!(ep.serial(), "emulator-5556");
         assert_eq!(ep.token, None);
+    }
+
+    /// A leftover file from a crashed emulator must not shadow the live one.
+    #[test]
+    fn newest_discovery_file_wins() {
+        let dir = std::env::temp_dir().join(format!("emugrid-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Live emulator written first, stale one after (so "last read wins" picks it).
+        std::fs::write(
+            dir.join("pid_200.ini"),
+            "port.serial=5554\ngrpc.port=8600\n",
+        )
+        .unwrap();
+        let stale = dir.join("pid_050.ini");
+        std::fs::write(&stale, "port.serial=5554\ngrpc.port=8554\n").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        let found = discover_in(std::slice::from_ref(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(found["emulator-5554"].grpc_port, 8600);
+    }
+
+    /// A port that accepts TCP but never speaks HTTP/2 must not hang the worker.
+    #[test]
+    fn silent_server_times_out() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _hold = std::thread::spawn(move || {
+            let conn = listener.accept();
+            std::thread::sleep(Duration::from_secs(30));
+            drop(conn);
+        });
+        let ep = Endpoint {
+            console_port: 5554,
+            grpc_port: port,
+            token: None,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let control = Control::new(320);
+            let _ = tx.send(stream(&ep, &control, |_| {}));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(12));
+        assert!(
+            matches!(result, Ok(Err(_))),
+            "stream hung or succeeded: {result:?}"
+        );
     }
 
     /// Spike: connect to the first local emulator and measure frame rate.

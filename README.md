@@ -52,7 +52,9 @@ Builds are produced by the manual **Build** workflow (Actions tab → *Build* �
 macOS (Apple Silicon and Intel, as `emugrid.app`), Windows (`emugrid.exe`) and Linux.
 Give it a `release_tag` to publish a GitHub release too.
 
-> The macOS app is unsigned: the first time, right-click it → **Open**.
+> The macOS app is not notarized. The first time you open it, macOS blocks it:
+> go to **System Settings → Privacy & Security** and click **Open Anyway**
+> (or run `xattr -dr com.apple.quarantine emugrid.app`).
 
 ## Build & run
 

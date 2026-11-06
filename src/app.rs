@@ -85,6 +85,9 @@ pub struct EmuGrid {
     visible: HashSet<String>,
     /// Accumulated scroll (points) and when it last changed.
     scroll: (f32, Option<Instant>),
+    gestures: input::GestureTracker,
+    /// Tab presses taken from egui, to send to the focused device.
+    pending_tabs: usize,
 }
 
 impl EmuGrid {
@@ -118,6 +121,8 @@ impl EmuGrid {
             input_tx,
             visible: HashSet::new(),
             scroll: (0.0, None),
+            gestures: input::GestureTracker::default(),
+            pending_tabs: 0,
         }
     }
 
@@ -173,6 +178,7 @@ impl EmuGrid {
         let alive: HashSet<String> = wanted.iter().map(|(s, _)| s.clone()).collect();
         self.capture.sync(wanted);
         self.screens.retain(|s, _| alive.contains(s));
+        self.screen_sizes.retain(|s, _| alive.contains(s));
         if self.focused.as_ref().is_some_and(|f| !alive.contains(f)) {
             self.focused = None;
         }
@@ -553,26 +559,20 @@ impl EmuGrid {
             input::to_device((uv.x, uv.y), screen, landscape)
         };
         let ctx = ui.ctx();
-        if resp.drag_stopped() {
-            let start = ctx.input(|i| i.pointer.press_origin());
-            let end = ctx.input(|i| i.pointer.interact_pos());
-            let held = ctx.input(|i| i.pointer.press_start_time().map(|t| i.time - t));
-            if let (Some(a), Some(b)) = (start, end)
-                && img.contains(a)
-            {
+        match self.gestures.update(&resp) {
+            Some(input::Gesture::Tap(p)) if img.contains(p) => {
+                let (x, y) = to_dev(p);
+                actions.push(shell(&format!("input tap {x} {y}")));
+            }
+            Some(input::Gesture::LongPress(p)) if img.contains(p) => {
+                let (x, y) = to_dev(p);
+                actions.push(shell(&format!("input swipe {x} {y} {x} {y} 800")));
+            }
+            Some(input::Gesture::Swipe(a, b, ms)) if img.contains(a) => {
                 let ((x1, y1), (x2, y2)) = (to_dev(a), to_dev(b));
-                let ms = held.map_or(300, |s| (s * 1000.0) as u32).clamp(80, 2000);
                 actions.push(shell(&format!("input swipe {x1} {y1} {x2} {y2} {ms}")));
             }
-        } else if (resp.clicked() || resp.secondary_clicked())
-            && let Some(p) = resp.interact_pointer_pos().filter(|p| img.contains(*p))
-        {
-            let (x, y) = to_dev(p);
-            actions.push(shell(&if resp.clicked() {
-                format!("input tap {x} {y}")
-            } else {
-                format!("input swipe {x} {y} {x} {y} 800")
-            }));
+            _ => {}
         }
         // Scroll wheel / trackpad → one swipe once the gesture settles.
         if resp.hovered() {
@@ -614,8 +614,9 @@ impl EmuGrid {
     }
 
     /// Keyboard → device, while a device is focused.
-    fn forward_keys(&self, ctx: &egui::Context, serial: &str, actions: &mut Vec<Action>) {
-        if ctx.egui_wants_keyboard_input() {
+    fn forward_keys(&mut self, ctx: &egui::Context, serial: &str, actions: &mut Vec<Action>) {
+        let tabs = std::mem::take(&mut self.pending_tabs);
+        if ctx.text_edit_focused() {
             return;
         }
         let android = self
@@ -656,6 +657,11 @@ impl EmuGrid {
                 serial.into(),
                 format!("input text {}", input::escape_text(&text)),
             ));
+        }
+        if android {
+            for _ in 0..tabs {
+                actions.push(Action::Shell(serial.into(), "input keyevent 61".into()));
+            }
         }
     }
 
@@ -790,6 +796,31 @@ fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
 }
 
 impl eframe::App for EmuGrid {
+    /// Runs even while the window is hidden (when `ui` is skipped): pause all
+    /// streams then, so hidden tiles cost nothing.
+    /// While a device is focused the keyboard belongs to it: take Tab before
+    /// egui turns it into widget focus, and make sure no button holds focus
+    /// (Enter / Space would press it).
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.focused.is_none() || self.view != View::Grid {
+            return;
+        }
+        self.pending_tabs += input::take_tabs(&mut raw.events);
+        ctx.memory_mut(|m| {
+            if let Some(id) = m.focused() {
+                m.surrender_focus(id);
+            }
+        });
+    }
+
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if ctx.input(|i| i.viewport().visible() == Some(false)) {
+            for (_, c) in self.capture.controls() {
+                c.active.store(false, Ordering::Relaxed);
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
         let full = ui.max_rect();
@@ -933,5 +964,21 @@ impl eframe::App for EmuGrid {
             };
             c.max_fps.store(fps, Ordering::Relaxed);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serials get reused (`emulator-5554`), so a stopped device's screen
+    /// size must not be used for the next device that takes its serial.
+    #[test]
+    fn forgets_screen_size_when_device_goes_away() {
+        let mut app = EmuGrid::new(&egui::Context::default());
+        app.screen_sizes
+            .insert("emulator-5554".into(), (1080, 2400));
+        app.on_scan(Vec::new(), HashMap::new());
+        assert!(app.screen_sizes.is_empty());
     }
 }
