@@ -7,16 +7,17 @@
 - [x] Background auto-refresh
 - [x] Size-optimized release build (~3 MB)
 
-## v0.2: Live grid
-- [ ] Screen thumbnail per running device (`adb screencap` first)
-- [ ] Grid layout that adapts to window size
+## v0.2: Live grid ([plan](plans/v0.2-live-grid.md))
+- [ ] Grid of live screen tiles, List / Grid toggle
+- [ ] PNG fallback via `adb screencap` (~1 fps, works for every device)
+- [ ] Emulator gRPC stream for SDK-started emulators (≥ 10 fps)
 - [ ] Click a tile to enlarge it
+- [ ] Binary stays ≤ 8 MB (checked in CI)
 
-## v0.3: Smooth streaming & control
-- [ ] Emulator gRPC screen stream
-- [ ] Tap / swipe / type on a tile
+## v0.3: Control & smooth streaming everywhere
+- [ ] Tap / swipe / type on a tile (gRPC `sendTouch` / `sendKey`)
 - [ ] Hardware buttons (back, home, recents, rotate)
-- [ ] Per-tile FPS / resolution cap
+- [ ] scrcpy-based stream for TCP emulators (e.g. Orca's) and real phones
 
 ## v0.4: Quality of life
 - [ ] Cold boot / wipe data
