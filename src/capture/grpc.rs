@@ -150,36 +150,48 @@ async fn stream_async(
     let mut body = resp.into_body();
     let mut reader = FrameReader::default();
     let mut last_sent: Option<Instant> = None;
+    // The emulator only pushes when the screen changes, so a frame skipped by
+    // the rate cap is kept here and flushed later instead of being lost.
+    let mut pending: Option<Vec<u8>> = None;
     loop {
-        if control.stop.load(Ordering::Relaxed) || control.size.load(Ordering::Relaxed) != size {
+        // Hidden tile, new size or shutdown: hang up so the emulator stops encoding.
+        if control.stop.load(Ordering::Relaxed)
+            || !control.active.load(Ordering::Relaxed)
+            || control.size.load(Ordering::Relaxed) != size
+        {
             return Ok(());
         }
-        let chunk = match tokio::time::timeout(Duration::from_millis(250), body.data()).await {
-            Err(_) => continue, // screen unchanged; re-check control
-            Ok(None) => return Err("stream ended".into()),
-            Ok(Some(chunk)) => chunk.map_err(|e| err(&e))?,
+        let min_gap = Duration::from_secs(1) / control.max_fps.load(Ordering::Relaxed).max(1);
+        let wait = match (&pending, last_sent) {
+            (Some(_), Some(t)) => min_gap.saturating_sub(t.elapsed()),
+            (Some(_), None) => Duration::ZERO,
+            (None, _) => Duration::from_millis(250),
         };
-        let _ = body.flow_control().release_capacity(chunk.len());
-        reader.push(&chunk);
-        while let Some(m) = reader.next_message() {
-            // Only forward frames while visible, and at most `max_fps`.
-            let min_gap = Duration::from_secs(1) / control.max_fps.load(Ordering::Relaxed).max(1);
-            if !control.active.load(Ordering::Relaxed)
-                || last_sent.is_some_and(|t| t.elapsed() < min_gap)
-            {
-                continue;
+        match tokio::time::timeout(wait, body.data()).await {
+            Err(_) => {} // nothing new; maybe flush `pending` below
+            Ok(None) => return Err("stream ended".into()),
+            Ok(Some(chunk)) => {
+                let chunk = chunk.map_err(|e| err(&e))?;
+                let _ = body.flow_control().release_capacity(chunk.len());
+                reader.push(&chunk);
+                while let Some(m) = reader.next_message() {
+                    pending = Some(m);
+                }
             }
-            if let Some(img) = proto::decode_image(&m)
-                && img.pixels.len() == (img.width * img.height * 3) as usize
-                && img.width > 0
-            {
-                last_sent = Some(Instant::now());
-                send(Frame {
-                    width: img.width,
-                    height: img.height,
-                    rgb: img.pixels,
-                });
-            }
+        }
+        if last_sent.is_some_and(|t| t.elapsed() < min_gap) {
+            continue;
+        }
+        if let Some(img) = pending.take().and_then(|m| proto::decode_image(&m))
+            && img.width > 0
+            && img.pixels.len() == (img.width * img.height * 3) as usize
+        {
+            last_sent = Some(Instant::now());
+            send(Frame {
+                width: img.width,
+                height: img.height,
+                rgb: img.pixels,
+            });
         }
     }
 }

@@ -14,11 +14,18 @@ pub fn decode(bytes: &[u8]) -> Option<Frame> {
     let rgb = match info.color_type {
         png::ColorType::Rgb => buf.to_vec(),
         png::ColorType::Rgba => buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[0], p[1], p[2]])
             .collect(),
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g]).collect(),
-        png::ColorType::GrayscaleAlpha => buf.chunks_exact(2).flat_map(|p| [p[0]; 3]).collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0]; 3])
+            .collect(),
         png::ColorType::Indexed => return None, // EXPAND turns this into RGB(A)
     };
     Some(Frame {
@@ -50,7 +57,7 @@ pub fn downscale(frame: Frame, max_edge: u32) -> Frame {
             let mut sum = [0u32; 3];
             for sy in y0..y1 {
                 let row = &frame.rgb[(sy * w + x0) * 3..(sy * w + x1) * 3];
-                for p in row.chunks_exact(3) {
+                for p in row.as_chunks::<3>().0 {
                     sum[0] += u32::from(p[0]);
                     sum[1] += u32::from(p[1]);
                     sum[2] += u32::from(p[2]);

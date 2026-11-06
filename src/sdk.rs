@@ -1,12 +1,16 @@
 //! Locating the Android SDK tools (`adb`, `emulator`) on any OS.
 
 use std::env;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
 pub struct Sdk {
     pub adb: Option<PathBuf>,
     pub emulator: Option<PathBuf>,
+    /// `xcrun simctl` works (macOS with Xcode installed).
+    pub simctl: bool,
 }
 
 impl Sdk {
@@ -15,8 +19,29 @@ impl Sdk {
         Self {
             adb: find_tool(&roots, "platform-tools", "adb"),
             emulator: find_tool(&roots, "emulator", "emulator"),
+            simctl: cfg!(target_os = "macos")
+                && command("xcrun")
+                    .args(["--find", "simctl"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|s| s.success()),
         }
     }
+}
+
+/// A `Command` that never flashes a console window on Windows.
+pub fn command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(Stdio::null());
+    cmd
 }
 
 fn exe(name: &str) -> String {

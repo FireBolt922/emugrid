@@ -1,14 +1,22 @@
 //! Discovering emulators and devices, and starting / stopping them.
 
-use crate::sdk::Sdk;
+use crate::ios;
+use crate::sdk::{Sdk, command};
 use std::collections::BTreeMap;
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::Stdio;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Platform {
+    Android,
+    Ios,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum State {
     /// Created in the SDK but not running.
     Stopped,
-    /// Running and reachable over adb (serial like `emulator-5554`).
+    /// Running and reachable (adb serial like `emulator-5554`, or an iOS UDID).
     Running { serial: String },
     /// Seen by adb but not ready yet (booting, offline, unauthorized...).
     Other { serial: String, status: String },
@@ -18,8 +26,35 @@ pub enum State {
 pub struct Device {
     /// AVD name for emulators, model/serial for physical devices.
     pub name: String,
+    pub platform: Platform,
     pub is_emulator: bool,
     pub state: State,
+    /// AVD name, if this is one of the SDK's AVDs (enables start / cold boot / wipe).
+    pub avd: Option<String>,
+    /// iOS: runtime ("iOS 18.2") and UDID.
+    pub runtime: Option<String>,
+    pub udid: Option<String>,
+}
+
+impl Device {
+    pub fn serial(&self) -> Option<&str> {
+        match &self.state {
+            State::Running { serial } => Some(serial),
+            _ => None,
+        }
+    }
+}
+
+fn android(name: String, is_emulator: bool, state: State, avd: Option<String>) -> Device {
+    Device {
+        name,
+        platform: Platform::Android,
+        is_emulator,
+        state,
+        avd,
+        runtime: None,
+        udid: None,
+    }
 }
 
 /// One full scan: installed AVDs merged with whatever adb currently sees.
@@ -29,11 +64,7 @@ pub fn scan(sdk: &Sdk) -> Vec<Device> {
     for avd in list_avds(sdk) {
         by_name.insert(
             avd.clone(),
-            Device {
-                name: avd,
-                is_emulator: true,
-                state: State::Stopped,
-            },
+            android(avd.clone(), true, State::Stopped, Some(avd)),
         );
     }
 
@@ -65,11 +96,7 @@ pub fn scan(sdk: &Sdk) -> Vec<Device> {
             Some(name) => {
                 by_name.insert(
                     name.clone(),
-                    Device {
-                        name,
-                        is_emulator,
-                        state,
-                    },
+                    android(name.clone(), is_emulator, state, Some(name)),
                 );
             }
             // Anything else: keyed by serial so identical models don't collide.
@@ -77,24 +104,23 @@ pub fn scan(sdk: &Sdk) -> Vec<Device> {
                 let name = model.unwrap_or_else(|| serial.clone());
                 by_name.insert(
                     format!("~{serial}"),
-                    Device {
-                        name,
-                        is_emulator,
-                        state,
-                    },
+                    android(name, is_emulator, state, None),
                 );
             }
         }
     }
 
     let mut list: Vec<Device> = by_name.into_values().collect();
+    if sdk.simctl {
+        list.extend(ios_simulators());
+    }
     // Running first, then alphabetical.
     list.sort_by_key(|d| (matches!(d.state, State::Stopped), d.name.to_lowercase()));
     list
 }
 
-fn run(program: &std::path::Path, args: &[&str]) -> Option<String> {
-    let out = Command::new(program)
+fn run(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Option<String> {
+    let out = command(program)
         .args(args)
         .stderr(Stdio::null())
         .output()
@@ -160,13 +186,55 @@ fn props(sdk: &Sdk, serial: &str) -> (Option<String>, bool) {
     (model, lines.next() == Some("1"))
 }
 
+fn ios_simulators() -> Vec<Device> {
+    let out = run("xcrun", &["simctl", "list", "devices", "available"]).unwrap_or_default();
+    ios::parse_list(&out)
+        .into_iter()
+        // Watch / TV / Vision simulators have no phone-like screen worth gridding.
+        .filter(|s| s.runtime.starts_with("iOS"))
+        .map(|s| Device {
+            name: s.name,
+            platform: Platform::Ios,
+            is_emulator: true,
+            state: if s.booted {
+                State::Running {
+                    serial: s.udid.clone(),
+                }
+            } else {
+                State::Stopped
+            },
+            avd: None,
+            runtime: Some(s.runtime),
+            udid: Some(s.udid),
+        })
+        .collect()
+}
+
+/// How to boot an AVD.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Boot {
+    Normal,
+    /// Ignore the quick-boot snapshot.
+    Cold,
+    /// Factory reset the AVD first.
+    Wipe,
+}
+
 /// Launch an AVD in the background; the emulator outlives this app.
-pub fn start(sdk: &Sdk, avd: &str) -> Result<(), String> {
+pub fn start(sdk: &Sdk, avd: &str, boot: Boot) -> Result<(), String> {
     let emu = sdk.emulator.as_ref().ok_or("emulator binary not found")?;
-    Command::new(emu)
-        .args(["-avd", avd])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
+    let mut cmd = command(emu);
+    cmd.args(["-avd", avd]);
+    match boot {
+        Boot::Normal => {}
+        Boot::Cold => {
+            cmd.arg("-no-snapshot-load");
+        }
+        Boot::Wipe => {
+            cmd.arg("-wipe-data");
+        }
+    }
+    cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
@@ -176,11 +244,123 @@ pub fn start(sdk: &Sdk, avd: &str) -> Result<(), String> {
 /// Shut down a running emulator.
 pub fn stop(sdk: &Sdk, serial: &str) -> Result<(), String> {
     let adb = sdk.adb.as_ref().ok_or("adb not found")?;
-    Command::new(adb)
+    command(adb)
         .args(["-s", serial, "emu", "kill"])
         .output()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+pub fn ios_boot(udid: &str) -> Result<(), String> {
+    simctl(&["boot", udid])
+}
+
+pub fn ios_shutdown(udid: &str) -> Result<(), String> {
+    simctl(&["shutdown", udid])
+}
+
+/// Bring up Simulator.app showing this device (for interacting with it).
+pub fn ios_open(udid: &str) -> Result<(), String> {
+    command("open")
+        .args(["-a", "Simulator", "--args", "-CurrentDeviceUDID", udid])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+fn simctl(args: &[&str]) -> Result<(), String> {
+    let out = command("xcrun")
+        .arg("simctl")
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// `adb install -r` an APK on one device.
+pub fn install(sdk: &Sdk, serial: &str, apk: &Path) -> Result<(), String> {
+    let adb = sdk.adb.as_ref().ok_or("adb not found")?;
+    let out = command(adb)
+        .args(["-s", serial, "install", "-r"])
+        .arg(apk)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() && text.contains("Success") {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let line = err
+            .lines()
+            .chain(text.lines())
+            .find(|l| !l.trim().is_empty());
+        Err(line.unwrap_or("install failed").trim().to_string())
+    }
+}
+
+/// Run `adb -s <serial> shell <cmd>`; returns stdout.
+pub fn shell(sdk: &Sdk, serial: &str, cmd: &str) -> Result<String, String> {
+    let adb = sdk.adb.as_ref().ok_or("adb not found")?;
+    let out = command(adb)
+        .args(["-s", serial, "shell", cmd])
+        .output()
+        .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Rotate an emulator's screen 90°.
+pub fn rotate(sdk: &Sdk, serial: &str) -> Result<(), String> {
+    let adb = sdk.adb.as_ref().ok_or("adb not found")?;
+    command(adb)
+        .args(["-s", serial, "emu", "rotate"])
+        .output()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Save a full-resolution screenshot to the Desktop (or home). Returns the path.
+pub fn save_screenshot(sdk: &Sdk, device: &Device) -> Result<std::path::PathBuf, String> {
+    let serial = device.serial().ok_or("device not running")?;
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or("no home folder")?;
+    let dir = [home.join("Desktop"), home.clone()]
+        .into_iter()
+        .find(|d| d.is_dir())
+        .unwrap_or(home);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let safe: String = device
+        .name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let path = dir.join(format!("emugrid-{safe}-{stamp}.png"));
+    match device.platform {
+        Platform::Android => {
+            let adb = sdk.adb.as_ref().ok_or("adb not found")?;
+            let out = command(adb)
+                .args(["-s", serial, "exec-out", "screencap", "-p"])
+                .output()
+                .map_err(|e| e.to_string())?;
+            if out.stdout.is_empty() {
+                return Err("screencap returned nothing".into());
+            }
+            std::fs::write(&path, out.stdout).map_err(|e| e.to_string())?;
+        }
+        Platform::Ios => {
+            let p = path.to_string_lossy().into_owned();
+            simctl(&["io", serial, "screenshot", "--type=png", &p])?;
+        }
+    }
+    Ok(path)
 }
 
 #[cfg(test)]
