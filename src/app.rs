@@ -5,7 +5,7 @@ use crate::capture::{self, Manager, Source, grpc};
 use crate::devices::{self, Boot, Device, Platform, State};
 use crate::sdk::Sdk;
 use crate::touch::{Finger, Touch};
-use crate::{grid, input};
+use crate::{frame, grid, input};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -111,6 +111,23 @@ impl EmuGrid {
     pub fn new(ctx: &egui::Context) -> Self {
         let sdk = Sdk::detect();
         let (tx, rx) = mpsc::channel();
+        ctx.all_styles_mut(|s| {
+            s.spacing.button_padding = Vec2::new(10.0, 4.0);
+            s.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            s.spacing.interact_size.y = 26.0;
+            let w = &mut s.visuals.widgets;
+            for v in [
+                &mut w.noninteractive,
+                &mut w.inactive,
+                &mut w.hovered,
+                &mut w.active,
+                &mut w.open,
+            ] {
+                v.corner_radius = 6.into();
+            }
+            s.visuals.menu_corner_radius = 8.into();
+            s.visuals.window_corner_radius = 10.into();
+        });
 
         // One thread runs input commands in order, so taps and text never reorder.
         let (input_tx, input_rx) = mpsc::channel::<(String, String)>();
@@ -513,13 +530,13 @@ impl EmuGrid {
                             .serial()
                             .and_then(|s| self.screens.get(s))
                             .map_or(DEFAULT_ASPECT, Screen::aspect);
-                        (tile_w - 8.0) * aspect.clamp(0.4, 2.4)
+                        (tile_w - 24.0) * aspect.clamp(0.4, 2.4)
                     })
                     .fold(0.0, f32::max);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
                     for d in row {
-                        if let Some(a) = self.tile(ui, d, Vec2::new(tile_w, screen_h + 46.0), ppp) {
+                        if let Some(a) = self.tile(ui, d, Vec2::new(tile_w, screen_h + 64.0), ppp) {
                             actions.push(a);
                         }
                     }
@@ -536,81 +553,72 @@ impl EmuGrid {
             return None;
         }
         self.visible.insert(serial.clone());
-        let visuals = ui.visuals();
+        let visuals = ui.visuals().clone();
         let painter = ui.painter_at(rect);
-        let stroke = if resp.hovered() {
-            visuals.selection.stroke
-        } else {
-            visuals.widgets.noninteractive.bg_stroke
-        };
-        painter.rect(
-            rect,
-            8.0,
-            visuals.faint_bg_color,
-            stroke,
-            egui::StrokeKind::Inside,
-        );
+        if resp.hovered() {
+            painter.rect_filled(rect, 10.0, visuals.widgets.hovered.weak_bg_fill);
+        }
 
-        // Title.
-        let text = visuals.text_color();
-        painter.text(
-            rect.left_top() + Vec2::new(10.0, 8.0),
-            Align2::LEFT_TOP,
-            self.label(d),
-            FontId::proportional(13.0),
-            text,
-        );
-
-        // Screen.
+        // The phone, framed like the focused view.
         let screen_box = Rect::from_min_max(
-            rect.left_top() + Vec2::new(4.0, 26.0),
-            rect.right_bottom() - Vec2::new(4.0, 20.0),
+            rect.left_top() + Vec2::new(8.0, 8.0),
+            rect.right_bottom() - Vec2::new(8.0, 52.0),
         );
+        let aspect = self
+            .screens
+            .get(&serial)
+            .map_or(DEFAULT_ASPECT, Screen::aspect);
+        let layout = frame::fit(screen_box, aspect);
         let control = self.capture.control(&serial);
         if let Some(c) = control {
             c.size.store(
-                grid::bucket(screen_box.height().max(screen_box.width()) * ppp),
+                grid::bucket(layout.screen.height().max(layout.screen.width()) * ppp),
                 Ordering::Relaxed,
             );
         }
-        let img = self.paint_screen(&painter, &serial, screen_box);
-
-        // Status line.
-        let (label, color) = status_badge(d, control.map(|c| c.live.load(Ordering::Relaxed)));
-        painter.text(
-            Pos2::new(rect.left() + 10.0, rect.bottom() - 10.0),
-            Align2::LEFT_CENTER,
-            format!("⚫ {label}"),
-            FontId::proportional(11.0),
-            color,
-        );
-        if img.is_none() {
-            painter.text(
-                screen_box.center(),
-                Align2::CENTER_CENTER,
-                "waiting for screen…",
-                FontId::proportional(12.0),
-                visuals.weak_text_color(),
-            );
+        frame::paint_shell(&painter, &layout, visuals.dark_mode);
+        match self.screens.get(&serial) {
+            Some(screen) => frame::paint_screen(ui, &layout, &screen.tex),
+            None => {
+                frame::paint_blank(&painter, &layout);
+                painter.text(
+                    layout.screen.center(),
+                    Align2::CENTER_CENTER,
+                    "waiting for screen…",
+                    FontId::proportional(11.0),
+                    Color32::from_gray(150),
+                );
+            }
         }
+
+        // Name and status, centred under the phone.
+        let line = |text: String, font: FontId, color: Color32| {
+            let mut job =
+                egui::text::LayoutJob::single_section(text, egui::TextFormat::simple(font, color));
+            job.wrap = egui::text::TextWrapping::truncate_at_width(rect.width() - 16.0);
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
+        let name = line(
+            self.label(d),
+            FontId::proportional(13.0),
+            visuals.strong_text_color(),
+        );
+        let name_pos = Pos2::new(rect.center().x - name.size().x / 2.0, rect.bottom() - 42.0);
+        painter.galley(name_pos, name, Color32::PLACEHOLDER);
+        let (label, color) = status_badge(d, control.map(|c| c.live.load(Ordering::Relaxed)));
+        let status = line(label, FontId::proportional(11.0), visuals.weak_text_color());
+        let w = status.size().x + 10.0;
+        let y = rect.bottom() - 16.0;
+        let x = rect.center().x - w / 2.0;
+        painter.circle_filled(Pos2::new(x + 3.0, y), 3.0, color);
+        painter.galley(
+            Pos2::new(x + 10.0, y - status.size().y / 2.0),
+            status,
+            Color32::PLACEHOLDER,
+        );
         resp.on_hover_text("Click to open")
             .clicked()
             .then_some(Action::Focus(serial))
-    }
-
-    /// Draw the latest frame fitted into `area`. Returns where it was drawn.
-    fn paint_screen(&self, painter: &egui::Painter, serial: &str, area: Rect) -> Option<Rect> {
-        let screen = self.screens.get(serial)?;
-        let [w, h] = screen.size.map(|v| v as f32);
-        let scale = (area.width() / w).min(area.height() / h);
-        let rect = Rect::from_center_size(area.center(), Vec2::new(w, h) * scale);
-        painter.image(
-            screen.tex.id(),
-            rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
-        Some(rect)
     }
 
     fn empty_grid(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
@@ -648,110 +656,43 @@ impl EmuGrid {
         }
         let shell = |cmd: &str| Action::Shell(serial.to_string(), cmd.to_string());
 
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("⬅ Grid").on_hover_text("Esc").clicked() {
-                actions.push(Action::Unfocus);
-            }
-            let current = self.label(&d);
-            let others: Vec<(String, String)> = self
-                .running()
-                .filter_map(|o| Some((o.serial()?.to_string(), self.label(o))))
-                .collect();
-            egui::ComboBox::from_id_salt("device-switch")
-                .selected_text(egui::RichText::new(current).strong())
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    for (s, name) in others {
-                        if ui.selectable_label(s == serial, name).clicked() && s != serial {
-                            actions.push(Action::Focus(s));
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Switch device");
-            let live = self
-                .capture
-                .control(serial)
-                .map(|c| c.live.load(Ordering::Relaxed));
-            let (label, color) = status_badge(&d, live);
-            ui.colored_label(color, format!("⚫ {label}"));
-            ui.separator();
-            if android {
-                for (label, key, tip) in [
-                    ("◀ Back", 4, "Back"),
-                    ("🏠 Home", 3, "Home"),
-                    ("▣ Recents", 187, "Recent apps"),
-                    ("🔉", 25, "Volume down"),
-                    ("🔊", 24, "Volume up"),
-                    ("⚡ Power", 26, "Power button"),
-                ] {
-                    if ui.button(label).on_hover_text(tip).clicked() {
-                        actions.push(shell(&format!("input keyevent {key}")));
-                    }
-                }
-                if d.is_emulator
-                    && ui
-                        .button("⟳ Rotate")
-                        .on_hover_text("Rotate the emulator")
-                        .clicked()
-                {
-                    actions.push(Action::Rotate(serial.to_string()));
-                }
-            } else if let Some(udid) = &d.udid
-                && ui.button("Open in Simulator").clicked()
-            {
-                actions.push(Action::IosOpen(udid.clone()));
-            }
-            if ui
-                .button("📷 Screenshot")
-                .on_hover_text("Save screenshot to Desktop")
-                .clicked()
-            {
-                actions.push(Action::Screenshot(serial.to_string()));
-            }
-            if d.is_emulator && ui.button("■ Stop").clicked() {
-                actions.push(match &d.udid {
-                    Some(udid) => Action::IosShutdown(udid.clone()),
-                    None => Action::Stop(serial.to_string()),
-                });
-            }
-        });
-        ui.add_space(4.0);
+        self.toolbar(ui, &d, actions);
 
-        let hint_h = 18.0;
+        // Stage: the phone, framed and centred on a muted background.
         let area = ui.available_rect_before_wrap();
-        let area = Rect::from_min_max(area.min, area.max - Vec2::new(0.0, hint_h));
         let (rect, resp) = ui.allocate_exact_size(area.size(), Sense::click_and_drag());
+        let dark = ui.visuals().dark_mode;
+        ui.painter()
+            .rect_filled(rect, 0.0, Color32::from_gray(if dark { 34 } else { 232 }));
+        let aspect = self
+            .screens
+            .get(serial)
+            .map_or(DEFAULT_ASPECT, Screen::aspect);
+        let layout = frame::fit(rect.shrink(20.0), aspect);
         let ppp = ui.ctx().pixels_per_point();
         if let Some(c) = self.capture.control(serial) {
             c.size.store(
-                grid::bucket(rect.height().max(rect.width()) * ppp),
+                grid::bucket(layout.screen.height().max(layout.screen.width()) * ppp),
                 Ordering::Relaxed,
             );
         }
         self.visible.insert(serial.to_string());
         let painter = ui.painter_at(rect);
-        let img = self.paint_screen(&painter, serial, rect);
-        if img.is_none() {
-            ui.put(rect, egui::Spinner::new());
-        }
-        ui.vertical_centered(|ui| {
-            let direct = self.direct.as_ref().is_some_and(|(s, _)| s == serial);
-            let touch = if !android {
-                ""
-            } else if direct {
-                " · direct touch"
-            } else if self.direct_pending.as_deref() == Some(serial) {
-                " · connecting touch…"
-            } else {
-                " · basic touch (older Android)"
-            };
-            ui.small(if android {
-                format!("click = tap · drag = swipe · hold, then drag = move · type to send keys · Esc = back{touch}")
-            } else {
-                "View only — use “Open in Simulator” to interact".to_string()
-            });
-        });
+        frame::paint_shell(&painter, &layout, dark);
+        let img = match self.screens.get(serial) {
+            Some(screen) => {
+                frame::paint_screen(ui, &layout, &screen.tex);
+                Some(layout.screen)
+            }
+            None => {
+                frame::paint_blank(&painter, &layout);
+                ui.put(
+                    Rect::from_center_size(layout.screen.center(), Vec2::splat(24.0)),
+                    egui::Spinner::new(),
+                );
+                None
+            }
+        };
 
         // Input (Android only).
         let (Some(img), true) = (img, android) else {
@@ -842,6 +783,186 @@ impl EmuGrid {
                 actions.push(shell(&format!("input swipe {x1} {y1} {x2} {y2} 150")));
             }
         }
+    }
+
+    /// How touch reaches the focused Android device, for the status line.
+    fn touch_mode(&self, serial: &str) -> &'static str {
+        if self.direct.as_ref().is_some_and(|(s, _)| s == serial) {
+            "direct touch"
+        } else if self.direct_pending.as_deref() == Some(serial) {
+            "connecting touch…"
+        } else {
+            "basic touch"
+        }
+    }
+
+    /// The bar above a focused device: name and status on the left; device
+    /// picker and device buttons on the right.
+    fn toolbar(&mut self, ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
+        let Some(serial) = d.serial().map(str::to_string) else {
+            return;
+        };
+        let android = d.platform == Platform::Android;
+        let shell = |cmd: &str| Action::Shell(serial.clone(), cmd.to_string());
+        egui::Frame::NONE
+            .fill(ui.visuals().panel_fill)
+            .inner_margin(egui::Margin::symmetric(10, 7))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if frame::button(ui, frame::Icon::ArrowLeft, None, false)
+                        .on_hover_text("Back to all devices (Esc)")
+                        .clicked()
+                    {
+                        actions.push(Action::Unfocus);
+                    }
+                    let (r, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+                    frame::paint_icon(
+                        ui.painter(),
+                        frame::Icon::Phone,
+                        r,
+                        ui.visuals().text_color(),
+                    );
+                    let live = self
+                        .capture
+                        .control(&serial)
+                        .map(|c| c.live.load(Ordering::Relaxed));
+                    let (status, color) = match status_badge(d, live) {
+                        (s, _) if s == "live" => {
+                            ("Connected".to_string(), ui.visuals().weak_text_color())
+                        }
+                        other => other,
+                    };
+                    let status = if android {
+                        format!("{status} · {}", self.touch_mode(&serial))
+                    } else {
+                        format!("{status} · view only")
+                    };
+
+                    // Right side first, so the name gets whatever room is left.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if d.is_emulator {
+                            let stop = match &d.udid {
+                                Some(udid) => Action::IosShutdown(udid.clone()),
+                                None => Action::Stop(serial.clone()),
+                            };
+                            if frame::button(ui, frame::Icon::Power, None, true)
+                                .on_hover_text("Shut down")
+                                .clicked()
+                            {
+                                actions.push(stop);
+                            }
+                        }
+                        if android {
+                            let more = frame::button(ui, frame::Icon::More, None, false)
+                                .on_hover_text("More buttons");
+                            egui::Popup::menu(&more).show(|ui| {
+                                for (icon, text, key) in [
+                                    (frame::Icon::VolumeUp, "Volume up", 24),
+                                    (frame::Icon::VolumeDown, "Volume down", 25),
+                                    (frame::Icon::Power, "Power key (screen on/off)", 26),
+                                ] {
+                                    if frame::button(ui, icon, Some(text), false).clicked() {
+                                        actions.push(shell(&format!("input keyevent {key}")));
+                                    }
+                                }
+                            });
+                        }
+                        if frame::button(ui, frame::Icon::Camera, None, false)
+                            .on_hover_text("Screenshot to Desktop")
+                            .clicked()
+                        {
+                            actions.push(Action::Screenshot(serial.clone()));
+                        }
+                        if android {
+                            for (icon, key, tip) in [
+                                (frame::Icon::Recents, 187, "Recent apps"),
+                                (frame::Icon::Home, 3, "Home"),
+                                (frame::Icon::Back, 4, "Back"),
+                            ] {
+                                if frame::button(ui, icon, None, false)
+                                    .on_hover_text(tip)
+                                    .clicked()
+                                {
+                                    actions.push(shell(&format!("input keyevent {key}")));
+                                }
+                            }
+                            if d.is_emulator
+                                && frame::button(ui, frame::Icon::Rotate, Some("Rotate"), false)
+                                    .on_hover_text("Rotate the emulator")
+                                    .clicked()
+                            {
+                                actions.push(Action::Rotate(serial.clone()));
+                            }
+                        } else if let Some(udid) = &d.udid
+                            && ui.button("Open in Simulator").clicked()
+                        {
+                            actions.push(Action::IosOpen(udid.clone()));
+                        }
+                        self.device_picker(ui, &serial, actions);
+
+                        // Left side: name and status, cut short if space runs out.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(self.label(d)).strong())
+                                    .truncate(),
+                            );
+                            ui.add(
+                                egui::Label::new(egui::RichText::new(status).small().color(color))
+                                    .truncate(),
+                            );
+                        });
+                    });
+                });
+            });
+        let r = ui.min_rect();
+        ui.painter().hline(
+            r.x_range(),
+            r.bottom(),
+            ui.visuals().widgets.noninteractive.bg_stroke,
+        );
+    }
+
+    /// Dropdown of running devices, with a check by the one shown.
+    fn device_picker(&self, ui: &mut egui::Ui, serial: &str, actions: &mut Vec<Action>) {
+        let current = self
+            .device(serial)
+            .map(|d| self.label(d))
+            .unwrap_or_default();
+        let others: Vec<(String, String)> = self
+            .running()
+            .filter_map(|o| Some((o.serial()?.to_string(), self.label(o))))
+            .collect();
+        egui::ComboBox::from_id_salt("device-switch")
+            .selected_text(current)
+            .width(190.0)
+            .truncate()
+            .show_ui(ui, |ui| {
+                ui.set_min_width(220.0);
+                for (s, name) in others {
+                    let on = s == serial;
+                    let r = ui.selectable_label(on, format!("{name}      "));
+                    if on {
+                        let at = Rect::from_center_size(
+                            Pos2::new(r.rect.right() - 12.0, r.rect.center().y),
+                            Vec2::splat(13.0),
+                        );
+                        frame::paint_icon(
+                            ui.painter(),
+                            frame::Icon::Check,
+                            at,
+                            ui.visuals().text_color(),
+                        );
+                    }
+                    if r.clicked() && !on {
+                        actions.push(Action::Focus(s));
+                    }
+                }
+            })
+            .response
+            .on_hover_text("Switch device");
     }
 
     /// Keyboard -> device, while a device is focused.
@@ -1121,27 +1242,30 @@ impl eframe::App for EmuGrid {
         let mut actions = Vec::new();
         self.visible.clear();
 
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("emugrid");
-                ui.add_space(8.0);
-                let grid_on = self.view == View::Grid;
-                if ui.selectable_label(grid_on, "⊞ Grid").clicked() {
-                    actions.push(Action::View(View::Grid));
-                }
-                if ui.selectable_label(!grid_on, "☰ List").clicked() {
-                    actions.push(Action::View(View::List));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⟳ Refresh").clicked() {
-                        actions.push(Action::Refresh);
+        let focused = self.view == View::Grid && self.focused.is_some();
+        if !focused {
+            egui::Panel::top("top").show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("emugrid");
+                    ui.add_space(8.0);
+                    let grid_on = self.view == View::Grid;
+                    if ui.selectable_label(grid_on, "⊞ Grid").clicked() {
+                        actions.push(Action::View(View::Grid));
                     }
-                    if self.scanning {
-                        ui.spinner();
+                    if ui.selectable_label(!grid_on, "☰ List").clicked() {
+                        actions.push(Action::View(View::List));
                     }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("⟳ Refresh").clicked() {
+                            actions.push(Action::Refresh);
+                        }
+                        if self.scanning {
+                            ui.spinner();
+                        }
+                    });
                 });
             });
-        });
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| {
             let running = self.running().count();
@@ -1155,13 +1279,29 @@ impl eframe::App for EmuGrid {
                     ui.label(msg);
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small("Drop an .apk to install it everywhere")
-                        .on_hover_text("Installs on every running Android device");
+                    let ios = self
+                        .focused
+                        .as_deref()
+                        .and_then(|s| self.device(s))
+                        .is_some_and(|d| d.platform == Platform::Ios);
+                    if focused && ios {
+                        ui.small("View only · use “Open in Simulator” to interact");
+                    } else if focused {
+                        ui.small("click = tap · drag = swipe · hold, then drag = move · type to send keys · Esc = back");
+                    } else {
+                        ui.small("Drop an .apk to install it everywhere")
+                            .on_hover_text("Installs on every running Android device");
+                    }
                 });
             });
         });
 
-        egui::CentralPanel::default_margins().show(ui, |ui| {
+        let central = if focused {
+            egui::CentralPanel::no_frame().frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
+        } else {
+            egui::CentralPanel::default_margins()
+        };
+        central.show(ui, |ui| {
             if self.sdk.adb.is_none() && self.sdk.emulator.is_none() && !self.sdk.simctl {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,

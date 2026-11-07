@@ -3,6 +3,7 @@
 mod app;
 mod capture;
 mod devices;
+mod frame;
 mod grid;
 mod input;
 mod ios;

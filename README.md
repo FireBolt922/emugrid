@@ -19,17 +19,19 @@ open-source app that does just that. emugrid aims to be it:
 ## Features
 
 **Grid view**
-- Every running emulator, phone and iOS simulator as a **live screen tile**
+- Every running emulator, phone and iOS simulator as a **live screen** in a phone frame
 - SDK-started emulators stream over the emulator's **gRPC** API (smooth, pushed on change);
   everything else (Orca/TCP emulators, USB phones, iOS simulators) is polled as PNG (~2 fps)
 - Tiles scrolled out of view, and a minimized window, **pause** their streams
 
 **Focused view** (click a tile)
+- The phone in a device frame, with a slim toolbar: device name and status, a **device picker**
+  to switch phones without going back, and the device buttons
 - Touch works like a real finger: **click** = tap, **drag** = swipe or fling, **hold** = long press,
   **hold then drag** = move an icon, **right-click** = long press, **scroll** = swipe
 - **Type** to send text and keys (Backspace, Enter, Tab, arrows); **Esc** goes back
-- Back / Home / Recents / Volume / Power buttons, **Rotate** (emulators)
-- 📷 save a full-resolution screenshot to your Desktop
+- **Rotate** (emulators), Back, Home, Recents, screenshot to Desktop, and volume / power keys under **⋯**
+- The power icon shuts the emulator or simulator down
 
 **List view**
 - Every AVD you've created, running or not, plus USB devices
