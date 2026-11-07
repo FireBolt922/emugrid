@@ -25,7 +25,8 @@ open-source app that does just that. emugrid aims to be it:
 - Tiles scrolled out of view, and a minimized window, **pause** their streams
 
 **Focused view** (click a tile)
-- **Click** = tap, **drag** = swipe, **right-click** = long press, **scroll** = swipe
+- Touch works like a real finger: **click** = tap, **drag** = swipe or fling, **hold** = long press,
+  **hold then drag** = move an icon, **right-click** = long press, **scroll** = swipe
 - **Type** to send text and keys (Backspace, Enter, Tab, arrows); **Esc** goes back
 - Back / Home / Recents / Volume / Power buttons, **Rotate** (emulators)
 - 📷 save a full-resolution screenshot to your Desktop
@@ -75,7 +76,8 @@ On Linux you need `libxkbcommon-dev libgl1-mesa-dev libwayland-dev` to build.
 | Start / stop | `emulator -avd <name>` (`-no-snapshot-load`, `-wipe-data`) / `adb emu kill` |
 | Live screen (SDK emulators) | gRPC `EmulatorController/streamScreenshot`, RGB888 scaled on the emulator; port and token from the emulator's discovery file |
 | Screen (everything else) | `adb exec-out screencap -p` / `xcrun simctl io <udid> screenshot` |
-| Touch, keys, buttons | `adb shell input tap / swipe / text / keyevent`, `adb emu rotate` |
+| Touch | A virtual touchscreen made with the device's built-in `uinput` tool (Android 11+) over one open `adb shell`, so every press, move and release arrives live. Older devices fall back to `adb shell input`. Nothing is installed. |
+| Keys, buttons | `adb shell input text / keyevent`, `adb emu rotate` |
 | iOS simulators | `xcrun simctl list / boot / shutdown` |
 | UI | [egui](https://github.com/emilk/egui) via `eframe` (OpenGL) |
 

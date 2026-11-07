@@ -7,6 +7,7 @@ mod grid;
 mod input;
 mod ios;
 mod sdk;
+mod touch;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {

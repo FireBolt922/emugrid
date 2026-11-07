@@ -4,6 +4,7 @@
 use crate::capture::{self, Manager, Source, grpc};
 use crate::devices::{self, Boot, Device, Platform, State};
 use crate::sdk::Sdk;
+use crate::touch::{Finger, Touch};
 use crate::{grid, input};
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -35,6 +36,8 @@ enum Msg {
     Status(String),
     /// `None` when `wm size` failed; it is asked again.
     ScreenSize(String, Option<(u32, u32)>),
+    /// Direct touch set up (or not) for a device.
+    Direct(String, Result<Finger, String>),
 }
 
 /// Things the user asked for while the UI was being drawn.
@@ -91,6 +94,15 @@ pub struct EmuGrid {
     pending_tabs: usize,
     /// A live finger held down on a device: serial and last device position.
     finger: Option<(String, (u32, u32))>,
+    /// Direct touch (virtual touchscreen) for the focused device.
+    direct: Option<(String, Finger)>,
+    /// Serial whose direct touch is being set up.
+    direct_pending: Option<String>,
+    /// Devices where direct touch is unavailable; they use `input` commands.
+    direct_failed: HashSet<String>,
+    /// Direct touch: finger is down, where it was last sent, and (for a
+    /// right-click long press) when to lift it.
+    touching: Option<(Pos2, Option<Instant>)>,
     /// Serials with a `wm size` lookup in flight.
     size_pending: HashSet<String>,
 }
@@ -134,6 +146,10 @@ impl EmuGrid {
             pending_tabs: 0,
             size_pending: HashSet::new(),
             finger: None,
+            direct: None,
+            direct_pending: None,
+            direct_failed: HashSet::new(),
+            touching: None,
         }
     }
 
@@ -190,6 +206,15 @@ impl EmuGrid {
         self.capture.sync(wanted);
         self.screens.retain(|s, _| alive.contains(s));
         self.screen_sizes.retain(|s, _| alive.contains(s));
+        self.direct_failed.retain(|s| alive.contains(s));
+        if self
+            .direct
+            .as_ref()
+            .is_some_and(|(s, _)| !alive.contains(s))
+        {
+            self.direct = None;
+            self.touching = None;
+        }
         if self.focused.as_ref().is_some_and(|f| !alive.contains(f)) {
             self.focused = None;
         }
@@ -222,11 +247,111 @@ impl EmuGrid {
     /// Never leave a finger pressed on a device we stop looking at.
     fn lift_finger(&mut self) {
         self.gestures = input::GestureTracker::default();
+        if let (Some(_), Some((_, f))) = (self.touching.take(), self.direct.as_mut()) {
+            f.send(Touch::Up);
+        }
+        // Dropping it removes the virtual touchscreen from the device.
+        self.direct = None;
         if let Some((serial, (x, y))) = self.finger.take() {
             let _ = self
                 .input_tx
                 .send((serial, format!("input motionevent CANCEL {x} {y}")));
         }
+    }
+
+    /// Set up direct touch for the focused Android device, once.
+    fn ensure_direct(&mut self, ctx: &egui::Context, serial: &str) {
+        let ready = self.direct.as_ref().is_some_and(|(s, _)| s == serial);
+        if ready
+            || self.direct_pending.as_deref() == Some(serial)
+            || self.direct_failed.contains(serial)
+        {
+            return;
+        }
+        self.direct_pending = Some(serial.to_string());
+        let (sdk, tx, s, ctx) = (
+            self.sdk.clone(),
+            self.tx.clone(),
+            serial.to_string(),
+            ctx.clone(),
+        );
+        thread::spawn(move || {
+            let finger = Finger::start(&sdk, &s);
+            let _ = tx.send(Msg::Direct(s, finger));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Direct touch: press, every move and release go straight to the
+    /// device. Returns false when direct touch isn't available.
+    fn direct_input(&mut self, resp: &egui::Response, serial: &str, img: Rect) -> bool {
+        let Some((_, finger)) = self.direct.as_mut().filter(|(s, _)| s == serial) else {
+            return false;
+        };
+        let uv = |p: Pos2| {
+            let t = (p - img.min) / img.size();
+            (t.x, t.y)
+        };
+        let (pos, primary_down, now) = resp.ctx.input(|i| {
+            (
+                i.pointer.interact_pos(),
+                i.pointer.primary_down(),
+                Instant::now(),
+            )
+        });
+        let mut steps = Vec::new();
+        match self.touching {
+            None => {
+                let start = pos.filter(|p| img.contains(*p));
+                if primary_down && resp.is_pointer_button_down_on() {
+                    if let Some(p) = start {
+                        steps.push(Touch::Down(uv(p).0, uv(p).1));
+                        self.touching = Some((p, None));
+                    }
+                } else if resp.secondary_clicked() {
+                    if let Some(p) = start {
+                        steps.push(Touch::Down(uv(p).0, uv(p).1));
+                        let lift = now + Duration::from_millis(input::HOLD_MS as u64 + 300);
+                        self.touching = Some((p, Some(lift)));
+                    }
+                } else if resp.clicked() {
+                    // Press and release in one frame (trackpad tap).
+                    if let Some(p) = resp.interact_pointer_pos().filter(|p| img.contains(*p)) {
+                        steps.push(Touch::Down(uv(p).0, uv(p).1));
+                        steps.push(Touch::Up);
+                    }
+                }
+            }
+            Some((_, Some(lift))) => {
+                if now >= lift {
+                    steps.push(Touch::Up);
+                    self.touching = None;
+                } else {
+                    resp.ctx.request_repaint_after(lift - now);
+                }
+            }
+            Some((last, None)) => {
+                if primary_down {
+                    if let Some(p) = pos.filter(|p| *p != last) {
+                        steps.push(Touch::Move(uv(p).0, uv(p).1));
+                        self.touching = Some((p, None));
+                    }
+                } else {
+                    steps.push(Touch::Up);
+                    self.touching = None;
+                }
+            }
+        }
+        for step in steps {
+            if !finger.send(step) {
+                // Touchscreen went away (device stopped, adb restarted).
+                self.direct = None;
+                self.touching = None;
+                self.direct_failed.insert(serial.to_string());
+                return false;
+            }
+        }
+        true
     }
 
     /// Name shown for a device; emulators often share a model name, so add
@@ -519,6 +644,7 @@ impl EmuGrid {
         let android = d.platform == Platform::Android;
         if android {
             self.ensure_screen_size(ui.ctx(), serial);
+            self.ensure_direct(ui.ctx(), serial);
         }
         let shell = |cmd: &str| Action::Shell(serial.to_string(), cmd.to_string());
 
@@ -610,10 +736,20 @@ impl EmuGrid {
             ui.put(rect, egui::Spinner::new());
         }
         ui.vertical_centered(|ui| {
-            ui.small(if android {
-                "click = tap · drag = swipe · hold = long press, then drag to move · type to send keys · Esc = back"
+            let direct = self.direct.as_ref().is_some_and(|(s, _)| s == serial);
+            let touch = if !android {
+                ""
+            } else if direct {
+                " · direct touch"
+            } else if self.direct_pending.as_deref() == Some(serial) {
+                " · connecting touch…"
             } else {
-                "View only — use “Open in Simulator” to interact"
+                " · basic touch (older Android)"
+            };
+            ui.small(if android {
+                format!("click = tap · drag = swipe · hold, then drag = move · type to send keys · Esc = back{touch}")
+            } else {
+                "View only — use “Open in Simulator” to interact".to_string()
             });
         });
 
@@ -621,6 +757,7 @@ impl EmuGrid {
         let (Some(img), true) = (img, android) else {
             return;
         };
+        let direct = self.direct_input(&resp, serial, img);
         let Some(&screen) = self.screen_sizes.get(serial) else {
             return;
         };
@@ -633,7 +770,12 @@ impl EmuGrid {
             input::to_device((uv.x, uv.y), screen, landscape)
         };
         let ctx = ui.ctx();
-        match self.gestures.update(&resp) {
+        let gesture = if direct {
+            None
+        } else {
+            self.gestures.update(&resp)
+        };
+        match gesture {
             Some(input::Gesture::Tap(p)) if img.contains(p) => {
                 let (x, y) = to_dev(p);
                 actions.push(shell(&format!("input tap {x} {y}")));
@@ -921,6 +1063,20 @@ impl eframe::App for EmuGrid {
                     self.message = Some(s);
                     self.last_scan = None;
                 }
+                Msg::Direct(serial, finger) => {
+                    if self.direct_pending.as_deref() == Some(serial.as_str()) {
+                        self.direct_pending = None;
+                    }
+                    match finger {
+                        Ok(f) if self.focused.as_deref() == Some(serial.as_str()) => {
+                            self.direct = Some((serial, f));
+                        }
+                        Ok(_) => {} // focus moved on; dropping it cleans up
+                        Err(_) => {
+                            self.direct_failed.insert(serial);
+                        }
+                    }
+                }
                 Msg::ScreenSize(serial, size) => {
                     self.size_pending.remove(&serial);
                     if let Some(size) = size {
@@ -1092,6 +1248,109 @@ mod tests {
                 .collect()
         });
         assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
+
+    /// With direct touch, press / drag / release stream straight to the
+    /// device as down, moves, up, and nothing goes through `input`.
+    #[test]
+    fn direct_touch_streams_press_drag_release() {
+        use egui::{Event, PointerButton, RawInput};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let ctx = egui::Context::default();
+        let mut app = EmuGrid::new(&ctx);
+        let serial = "emulator-5554";
+        app.devices = vec![Device {
+            name: "phone".into(),
+            platform: Platform::Android,
+            is_emulator: true,
+            state: State::Running {
+                serial: serial.into(),
+            },
+            avd: None,
+            runtime: None,
+            udid: None,
+        }];
+        let tex = ctx.load_texture(
+            "s",
+            egui::ColorImage::from_rgb([108, 240], &vec![0; 108 * 240 * 3]),
+            egui::TextureOptions::LINEAR,
+        );
+        app.screens.insert(
+            serial.into(),
+            Screen {
+                tex,
+                size: [108, 240],
+            },
+        );
+        app.screen_sizes.insert(serial.into(), (1080, 2400));
+        app.focused = Some(serial.into());
+        let sink = Sink::default();
+        app.direct = Some((serial.into(), Finger::to_writer(sink.clone())));
+
+        let button = |x: f32, y: f32, pressed| Event::PointerButton {
+            pos: Pos2::new(x, y),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let steps: Vec<(f64, Vec<Event>)> = vec![
+            (0.0, vec![Event::PointerMoved(Pos2::new(400.0, 300.0))]),
+            (0.1, vec![button(400.0, 300.0, true)]),
+            (0.2, vec![Event::PointerMoved(Pos2::new(410.0, 320.0))]),
+            (0.3, vec![Event::PointerMoved(Pos2::new(420.0, 340.0))]),
+            (0.4, vec![button(420.0, 340.0, false)]),
+            (0.5, vec![]),
+        ];
+        let mut sent = Vec::new();
+        for (t, events) in steps {
+            let raw = RawInput {
+                time: Some(t),
+                events,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(raw, |ui| {
+                let mut actions = Vec::new();
+                app.focused_view(ui, serial, &mut actions);
+                for a in actions {
+                    if let Action::Shell(_, cmd) = a {
+                        sent.push(cmd);
+                    }
+                }
+            });
+            out.textures_delta.clear();
+        }
+        // Don't leave the setup thread from ensure_direct dangling on a real adb.
+        app.direct_failed.insert(serial.into());
+
+        assert!(sent.iter().all(|c| !c.starts_with("input ")), "{sent:?}");
+        let written = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let kinds: Vec<&str> = written
+            .lines()
+            .map(|l| {
+                if l.contains(",57,1,") {
+                    "down"
+                } else if l.contains(",57,-1,") {
+                    "up"
+                } else {
+                    "move"
+                }
+            })
+            .collect();
+        assert_eq!(kinds, ["down", "move", "move", "up"], "{written}");
     }
 
     /// Clicking the middle of the focused screen sends a tap there.
