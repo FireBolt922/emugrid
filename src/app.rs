@@ -105,6 +105,9 @@ pub struct EmuGrid {
     touching: Option<(Pos2, Option<Instant>)>,
     /// Serials with a `wm size` lookup in flight.
     size_pending: HashSet<String>,
+    /// AVD name or iOS UDID started from the device picker: open it as
+    /// soon as it is running.
+    pending_focus: Option<String>,
 }
 
 impl EmuGrid {
@@ -167,6 +170,7 @@ impl EmuGrid {
             direct_pending: None,
             direct_failed: HashSet::new(),
             touching: None,
+            pending_focus: None,
         }
     }
 
@@ -234,6 +238,18 @@ impl EmuGrid {
         }
         if self.focused.as_ref().is_some_and(|f| !alive.contains(f)) {
             self.focused = None;
+        }
+        if let Some(want) = &self.pending_focus {
+            let up = self.devices.iter().find(|d| {
+                (d.avd.as_ref() == Some(want) || d.udid.as_ref() == Some(want))
+                    && matches!(d.state, State::Running { .. })
+            });
+            if let Some(serial) = up.and_then(|d| d.serial()) {
+                self.focused = Some(serial.to_string());
+                self.pending_focus = None;
+                self.lift_finger();
+                self.gestures = input::GestureTracker::default();
+            }
         }
     }
 
@@ -403,6 +419,7 @@ impl EmuGrid {
             Action::Unfocus => {
                 self.lift_finger();
                 self.focused = None;
+                self.pending_focus = None;
             }
             Action::View(v) => {
                 self.lift_finger();
@@ -411,10 +428,14 @@ impl EmuGrid {
             }
             Action::Refresh => self.last_scan = None,
             Action::Start(avd, boot) => {
+                if self.focused.is_some() {
+                    self.pending_focus = Some(avd.clone());
+                }
                 let how = match boot {
                     Boot::Normal => "Starting",
                     Boot::Cold => "Cold booting",
                     Boot::Wipe => "Wiping and starting",
+                    Boot::Window => "Starting",
                 };
                 self.message = Some(
                     devices::start(&self.sdk, &avd, boot)
@@ -430,6 +451,9 @@ impl EmuGrid {
                 self.last_scan = None;
             }
             Action::IosBoot(udid) => {
+                if self.focused.is_some() {
+                    self.pending_focus = Some(udid.clone());
+                }
                 self.message = Some("Booting simulator…".into());
                 self.background(ctx, move |_| {
                     devices::ios_boot(&udid).map(|_| "Simulator booted".into())
@@ -935,6 +959,25 @@ impl EmuGrid {
             .running()
             .filter_map(|o| Some((o.serial()?.to_string(), self.label(o))))
             .collect();
+        // Stopped AVDs and simulators: (name, how to start it, AVD or UDID).
+        let stopped: Vec<(String, Action, String)> = self
+            .devices
+            .iter()
+            .filter(|d| d.state == State::Stopped)
+            .filter_map(|d| match (&d.avd, &d.udid) {
+                (Some(avd), _) => Some((
+                    d.name.clone(),
+                    Action::Start(avd.clone(), Boot::Normal),
+                    avd.clone(),
+                )),
+                (None, Some(udid)) => Some((
+                    format!("{} (iOS)", d.name),
+                    Action::IosBoot(udid.clone()),
+                    udid.clone(),
+                )),
+                _ => None,
+            })
+            .collect();
         egui::ComboBox::from_id_salt("device-switch")
             .selected_text(current)
             .width(190.0)
@@ -958,6 +1001,21 @@ impl EmuGrid {
                     }
                     if r.clicked() && !on {
                         actions.push(Action::Focus(s));
+                    }
+                }
+                if !stopped.is_empty() {
+                    ui.separator();
+                    ui.weak("Not running · click to start");
+                    for (name, start, id) in stopped {
+                        let waiting = self.pending_focus.as_deref() == Some(id.as_str());
+                        let text = if waiting {
+                            format!("{name} · starting…")
+                        } else {
+                            name
+                        };
+                        if ui.selectable_label(false, text).clicked() && !waiting {
+                            actions.push(start);
+                        }
                     }
                 }
             })
@@ -1115,6 +1173,13 @@ fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
                                 }
                                 if ui.button("Wipe data and start").clicked() {
                                     actions.push(Action::Start(avd.clone(), Boot::Wipe));
+                                }
+                                if ui
+                                    .button("Start in its own window")
+                                    .on_hover_text("Also open the Android Emulator window")
+                                    .clicked()
+                                {
+                                    actions.push(Action::Start(avd.clone(), Boot::Window));
                                 }
                             });
                             if ui.button("▶ Start").clicked() {
@@ -1491,6 +1556,33 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, ["down", "move", "move", "up"], "{written}");
+    }
+
+    /// Picking a stopped phone in the dropdown opens it once it has booted.
+    #[test]
+    fn opens_a_started_phone_when_it_comes_up() {
+        let ctx = egui::Context::default();
+        let mut app = EmuGrid::new(&ctx);
+        let phone = |state| Device {
+            name: "small_phone".into(),
+            platform: Platform::Android,
+            is_emulator: true,
+            state,
+            avd: Some("small_phone".into()),
+            runtime: None,
+            udid: None,
+        };
+        app.pending_focus = Some("small_phone".into());
+        app.on_scan(vec![phone(State::Stopped)], HashMap::new());
+        assert_eq!(app.focused, None);
+        app.on_scan(
+            vec![phone(State::Running {
+                serial: "emulator-5556".into(),
+            })],
+            HashMap::new(),
+        );
+        assert_eq!(app.focused.as_deref(), Some("emulator-5556"));
+        assert_eq!(app.pending_focus, None);
     }
 
     /// Clicking the middle of the focused screen sends a tap there.

@@ -218,27 +218,34 @@ pub enum Boot {
     Cold,
     /// Factory reset the AVD first.
     Wipe,
+    /// Normal boot, with the emulator's own window as well.
+    Window,
 }
 
 /// Launch an AVD in the background; the emulator outlives this app.
 pub fn start(sdk: &Sdk, avd: &str, boot: Boot) -> Result<(), String> {
     let emu = sdk.emulator.as_ref().ok_or("emulator binary not found")?;
-    let mut cmd = command(emu);
-    cmd.args(["-avd", avd]);
-    match boot {
-        Boot::Normal => {}
-        Boot::Cold => {
-            cmd.arg("-no-snapshot-load");
-        }
-        Boot::Wipe => {
-            cmd.arg("-wipe-data");
-        }
-    }
-    cmd.stdout(Stdio::null())
+    command(emu)
+        .args(start_args(avd, boot))
+        .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// `emulator` arguments. emugrid shows the screen, so no window by default.
+fn start_args(avd: &str, boot: Boot) -> Vec<&str> {
+    let mut args = vec!["-avd", avd];
+    if boot != Boot::Window {
+        args.push("-no-window");
+    }
+    match boot {
+        Boot::Normal | Boot::Window => {}
+        Boot::Cold => args.push("-no-snapshot-load"),
+        Boot::Wipe => args.push("-wipe-data"),
+    }
+    args
 }
 
 /// Shut down a running emulator.
@@ -366,6 +373,25 @@ pub fn save_screenshot(sdk: &Sdk, device: &Device) -> Result<std::path::PathBuf,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// emugrid shows the screen itself, so emulators start without their
+    /// own window unless asked for one.
+    #[test]
+    fn emulators_start_headless_unless_a_window_is_wanted() {
+        assert_eq!(
+            start_args("pixel", Boot::Normal),
+            ["-avd", "pixel", "-no-window"]
+        );
+        assert_eq!(
+            start_args("pixel", Boot::Cold),
+            ["-avd", "pixel", "-no-window", "-no-snapshot-load"]
+        );
+        assert_eq!(
+            start_args("pixel", Boot::Wipe),
+            ["-avd", "pixel", "-no-window", "-wipe-data"]
+        );
+        assert_eq!(start_args("pixel", Boot::Window), ["-avd", "pixel"]);
+    }
 
     /// Runs against the local SDK; prints what the app would show.
     #[test]

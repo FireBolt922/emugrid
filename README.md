@@ -26,7 +26,7 @@ open-source app that does just that. emugrid aims to be it:
 
 **Focused view** (click a tile)
 - The phone in a device frame, with a slim toolbar: device name and status, a **device picker**
-  to switch phones without going back, and the device buttons
+  to switch phones without going back (stopped ones are listed too: pick one to start and open it), and the device buttons
 - Touch works like a real finger: **click** = tap, **drag** = swipe or fling, **hold** = long press,
   **hold then drag** = move an icon, **right-click** = long press, **scroll** = swipe
 - **Type** to send text and keys (Backspace, Enter, Tab, arrows); **Esc** goes back
@@ -35,7 +35,8 @@ open-source app that does just that. emugrid aims to be it:
 
 **List view**
 - Every AVD you've created, running or not, plus USB devices
-- **Start**, **Stop**, **Cold boot**, **Wipe data and start**
+- **Start**, **Stop**, **Cold boot**, **Wipe data and start**: emulators start without their own window,
+  since emugrid shows them (**… → Start in its own window** if you want it)
 - iOS simulators (macOS with Xcode): **Boot**, **Shut down**, **Open in Simulator**
 
 **Everywhere**
