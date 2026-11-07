@@ -22,9 +22,11 @@ open-source app that does just that. emugrid aims to be it:
 - Every running emulator, phone and iOS simulator as a **live screen** in a phone frame
 - SDK-started emulators stream over the emulator's **gRPC** API (smooth, pushed on change);
   everything else (Orca/TCP emulators, USB phones, iOS simulators) is polled as PNG (~2 fps)
+- A phone you start shows a **Starting** tile with a timer until its screen appears
 - Tiles scrolled out of view, and a minimized window, **pause** their streams
 
 **Focused view** (click a tile)
+- **Side by side** (optional): show two phones at once; click a phone to control it
 - The phone in a device frame, with a slim toolbar: device name and status, a **device picker**
   to switch phones without going back (stopped ones are listed too: pick one to start and open it), and the device buttons
 - Touch works like a real finger: **click** = tap, **drag** = swipe or fling, **hold** = long press,

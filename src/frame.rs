@@ -150,6 +150,30 @@ pub enum Icon {
     VolumeUp,
     Play,
     Open,
+    Split,
+}
+
+impl Icon {
+    /// What the icon means, for screen readers.
+    pub fn name(self) -> &'static str {
+        match self {
+            Icon::ArrowLeft => "Back to all devices",
+            Icon::Phone => "Phone",
+            Icon::Back => "Back",
+            Icon::Home => "Home",
+            Icon::Recents => "Recent apps",
+            Icon::Rotate => "Rotate",
+            Icon::Power => "Shut down",
+            Icon::Camera => "Screenshot",
+            Icon::More => "More",
+            Icon::Check => "Selected",
+            Icon::VolumeDown => "Volume down",
+            Icon::VolumeUp => "Volume up",
+            Icon::Play => "Start",
+            Icon::Open => "Open",
+            Icon::Split => "Side by side",
+        }
+    }
 }
 
 fn arc(c: Pos2, r: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -242,6 +266,12 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color3
         Icon::Check => {
             painter.line(vec![p(-0.3, 0.02), p(-0.08, 0.24), p(0.32, -0.22)], stroke);
         }
+        Icon::Split => {
+            for x in [-0.19, 0.19] {
+                let r = Rect::from_center_size(p(x, 0.0), Vec2::new(0.26, 0.6) * s);
+                painter.rect_stroke(r, radius(s * 0.06), stroke, StrokeKind::Middle);
+            }
+        }
         Icon::Play => {
             let pts = vec![p(-0.2, -0.32), p(0.3, 0.0), p(-0.2, 0.32)];
             painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
@@ -282,7 +312,7 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color3
 /// A toolbar button: an icon, optionally followed by a short label.
 /// `danger` turns it red on hover (for shutting a device down).
 pub fn button(ui: &mut egui::Ui, icon: Icon, label: Option<&str>, danger: bool) -> egui::Response {
-    let h = ui.spacing().interact_size.y.max(26.0);
+    let h = ui.spacing().interact_size.y.max(28.0);
     let icon_size = 15.0;
     let galley = label.map(|t| {
         ui.painter().layout_no_wrap(
@@ -296,6 +326,9 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, label: Option<&str>, danger: bool) 
         None => h,
     };
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, h), Sense::click());
+    // Screen readers get a name even for icon-only buttons.
+    let name = label.unwrap_or(icon.name()).to_string();
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), &name));
     if ui.is_rect_visible(rect) {
         let v = ui.style().interact(&resp);
         ui.painter().rect(
