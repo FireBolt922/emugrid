@@ -541,24 +541,42 @@ impl EmuGrid {
             return;
         }
         let ppp = ui.ctx().pixels_per_point();
+        // A row never gets taller than the window, so names stay in view.
+        let max_screen_h = (ui.available_height() - 64.0 - GAP).max(120.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             let width = ui.available_width();
             let cols = grid::columns(width, TILE_WIDTH, GAP, running.len());
-            let tile_w = ((width - GAP * (cols - 1) as f32) / cols as f32).min(TILE_WIDTH * 1.6);
+            let col_w = ((width - GAP * (cols - 1) as f32) / cols as f32).min(TILE_WIDTH * 1.6);
             for row in running.chunks(cols) {
-                // Each row is as tall as its tallest screen.
-                let screen_h = row
+                let aspects: Vec<f32> = row
                     .iter()
                     .map(|d| {
-                        let aspect = d
-                            .serial()
+                        d.serial()
                             .and_then(|s| self.screens.get(s))
-                            .map_or(DEFAULT_ASPECT, Screen::aspect);
-                        (tile_w - 24.0) * aspect.clamp(0.4, 2.4)
+                            .map_or(DEFAULT_ASPECT, Screen::aspect)
+                            .clamp(0.4, 2.4)
                     })
+                    .collect();
+                // Each row is as tall as its tallest screen, within the window.
+                let screen_h = aspects
+                    .iter()
+                    .map(|a| (col_w - 24.0) * a)
+                    .fold(0.0, f32::max)
+                    .min(max_screen_h);
+                // Narrow tiles to what their phones need once height is capped.
+                let widest = aspects
+                    .iter()
+                    .map(|a| screen_h / a + 24.0)
                     .fold(0.0, f32::max);
+                let tile_w = col_w.min(widest).max(120.0);
+                let row_w = tile_w * row.len() as f32 + GAP * (row.len() - 1) as f32;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
+                    // Centre the row (add_space is followed by one GAP).
+                    let pad = (width - row_w) / 2.0;
+                    if pad > GAP {
+                        ui.add_space(pad - GAP);
+                    }
                     for d in row {
                         if let Some(a) = self.tile(ui, d, Vec2::new(tile_w, screen_h + 64.0), ppp) {
                             actions.push(a);
@@ -1077,13 +1095,15 @@ impl EmuGrid {
 
     fn list_view(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.add_space(6.0);
             let android: Vec<&Device> = self
                 .devices
                 .iter()
                 .filter(|d| d.platform == Platform::Android)
                 .collect();
+            section_header(ui, "Android", &android);
             if android.is_empty() && !self.scanning {
-                ui.label("No Android emulators or devices found.");
+                note(ui, "No Android emulators or devices found. Create one in Android Studio's Device Manager.");
             }
             for d in android {
                 device_row(ui, d, actions);
@@ -1095,24 +1115,65 @@ impl EmuGrid {
                 .filter(|d| d.platform == Platform::Ios)
                 .collect();
             if !ios.is_empty() {
-                ui.add_space(8.0);
-                let booted = ios.iter().filter(|d| d.serial().is_some()).count();
-                egui::CollapsingHeader::new(format!(
-                    "iOS simulators · {} · {booted} booted",
-                    ios.len()
-                ))
-                .default_open(booted > 0 || ios.len() <= 6)
-                .show(ui, |ui| {
-                    for d in ios {
-                        device_row(ui, d, actions);
-                    }
-                });
+                ui.add_space(14.0);
+                section_header(ui, "iOS simulators · view only", &ios);
+                for d in ios {
+                    device_row(ui, d, actions);
+                }
             } else if cfg!(target_os = "macos") && !self.sdk.simctl {
-                ui.add_space(8.0);
-                ui.small("iOS simulators: install Xcode to see and control them here.");
+                ui.add_space(14.0);
+                section_header(ui, "iOS simulators", &[]);
+                note(
+                    ui,
+                    "iPhone simulators come with Xcode. If Xcode is installed, they show up here and can be watched live (view only).",
+                );
             }
         });
     }
+}
+
+/// "Android · 2 · 1 running" above a group of rows.
+fn section_header(ui: &mut egui::Ui, title: &str, devices: &[&Device]) {
+    ui.horizontal(|ui| {
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(title)
+                .small()
+                .strong()
+                .color(ui.visuals().weak_text_color()),
+        );
+        if !devices.is_empty() {
+            let running = devices.iter().filter(|d| d.serial().is_some()).count();
+            ui.label(
+                egui::RichText::new(format!("{} · {running} running", devices.len()))
+                    .small()
+                    .color(ui.visuals().weak_text_color()),
+            );
+        }
+    });
+    ui.add_space(2.0);
+}
+
+fn note(ui: &mut egui::Ui, text: &str) {
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .corner_radius(10)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(text).color(ui.visuals().weak_text_color()));
+        });
+}
+
+/// A small coloured label: "Running", "Stopped".
+fn pill(ui: &mut egui::Ui, text: &str, color: Color32) {
+    egui::Frame::NONE
+        .fill(color.gamma_multiply(0.18))
+        .corner_radius(9)
+        .inner_margin(egui::Margin::symmetric(8, 2))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(text).small().color(color));
+        });
 }
 
 /// Short status for a running device: how its screen is being captured.
@@ -1134,82 +1195,128 @@ fn status_badge(d: &Device, live: Option<bool>) -> (String, Color32) {
 }
 
 fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let (dot, color) = match &d.state {
-                State::Running { .. } => ("⚫", GREEN),
-                State::Other { .. } => ("⚫", AMBER),
-                State::Stopped => ("○", ui.visuals().weak_text_color()),
-            };
-            ui.colored_label(color, dot);
-            ui.vertical(|ui| {
-                ui.strong(&d.name);
-                let kind = match (d.platform, d.is_emulator) {
-                    (Platform::Ios, _) => {
-                        format!("iOS simulator · {}", d.runtime.as_deref().unwrap_or("iOS"))
-                    }
-                    (_, true) => "Emulator".into(),
-                    (_, false) => "Physical device".into(),
+    let visuals = ui.visuals().clone();
+    egui::Frame::NONE
+        .fill(visuals.faint_bg_color.gamma_multiply(1.6))
+        .stroke(visuals.widgets.noninteractive.bg_stroke)
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                // Device badge.
+                let (r, _) = ui.allocate_exact_size(Vec2::splat(36.0), Sense::hover());
+                let running = d.serial().is_some();
+                let tint = match d.platform {
+                    Platform::Android => Color32::from_rgb(61, 220, 132),
+                    Platform::Ios => Color32::from_rgb(160, 170, 185),
                 };
-                let detail = match &d.state {
-                    State::Running { serial } if d.platform == Platform::Ios => {
-                        format!("{kind} · booted")
-                    }
-                    State::Running { serial } => format!("{kind} · running · {serial}"),
-                    State::Other { serial, status } => format!("{kind} · {status} · {serial}"),
-                    State::Stopped => format!("{kind} · stopped"),
-                };
-                ui.small(detail);
-            });
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match (&d.state, d.platform) {
-                    (State::Stopped, Platform::Android) => {
-                        if let Some(avd) = &d.avd {
-                            ui.menu_button("…", |ui| {
-                                if ui.button("Cold boot").clicked() {
-                                    actions.push(Action::Start(avd.clone(), Boot::Cold));
-                                }
-                                if ui.button("Wipe data and start").clicked() {
-                                    actions.push(Action::Start(avd.clone(), Boot::Wipe));
-                                }
-                                if ui
-                                    .button("Start in its own window")
-                                    .on_hover_text("Also open the Android Emulator window")
+                ui.painter().rect_filled(
+                    r,
+                    9.0,
+                    tint.gamma_multiply(if running { 0.22 } else { 0.1 }),
+                );
+                frame::paint_icon(
+                    ui.painter(),
+                    frame::Icon::Phone,
+                    r.shrink(9.0),
+                    if running {
+                        tint
+                    } else {
+                        visuals.weak_text_color()
+                    },
+                );
+                ui.add_space(4.0);
+
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(&d.name).strong().size(14.0));
+                        match &d.state {
+                            State::Running { .. } => pill(ui, "Running", GREEN),
+                            State::Other { status, .. } => pill(ui, status, AMBER),
+                            State::Stopped => pill(ui, "Stopped", visuals.weak_text_color()),
+                        }
+                    });
+                    let kind = match (d.platform, d.is_emulator) {
+                        (Platform::Ios, _) => d.runtime.clone().unwrap_or_else(|| "iOS".into()),
+                        (_, true) => "Emulator".into(),
+                        (_, false) => "Physical device".into(),
+                    };
+                    let detail = match (&d.state, d.platform) {
+                        (State::Running { serial }, Platform::Android)
+                        | (State::Other { serial, .. }, Platform::Android) => {
+                            format!("{kind} · {serial}")
+                        }
+                        _ => kind,
+                    };
+                    ui.label(
+                        egui::RichText::new(detail)
+                            .small()
+                            .color(visuals.weak_text_color()),
+                    );
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    match (&d.state, d.platform) {
+                        (State::Stopped, Platform::Android) => {
+                            if let Some(avd) = &d.avd {
+                                let more = frame::button(ui, frame::Icon::More, None, false)
+                                    .on_hover_text("More ways to start");
+                                egui::Popup::menu(&more).show(|ui| {
+                                    if ui.button("Cold boot").clicked() {
+                                        actions.push(Action::Start(avd.clone(), Boot::Cold));
+                                    }
+                                    if ui.button("Wipe data and start").clicked() {
+                                        actions.push(Action::Start(avd.clone(), Boot::Wipe));
+                                    }
+                                    if ui
+                                        .button("Start in its own window")
+                                        .on_hover_text("Also open the Android Emulator window")
+                                        .clicked()
+                                    {
+                                        actions.push(Action::Start(avd.clone(), Boot::Window));
+                                    }
+                                });
+                                if frame::button(ui, frame::Icon::Play, Some("Start"), false)
                                     .clicked()
                                 {
-                                    actions.push(Action::Start(avd.clone(), Boot::Window));
+                                    actions.push(Action::Start(avd.clone(), Boot::Normal));
                                 }
-                            });
-                            if ui.button("▶ Start").clicked() {
-                                actions.push(Action::Start(avd.clone(), Boot::Normal));
                             }
                         }
-                    }
-                    (State::Stopped, Platform::Ios) => {
-                        if let Some(udid) = &d.udid
-                            && ui.button("▶ Boot").clicked()
-                        {
-                            actions.push(Action::IosBoot(udid.clone()));
+                        (State::Stopped, Platform::Ios) => {
+                            if let Some(udid) = &d.udid
+                                && frame::button(ui, frame::Icon::Play, Some("Boot"), false)
+                                    .clicked()
+                            {
+                                actions.push(Action::IosBoot(udid.clone()));
+                            }
                         }
-                    }
-                    (State::Running { serial }, platform) => {
-                        if d.is_emulator && ui.button("■ Stop").clicked() {
-                            actions.push(match (platform, &d.udid) {
-                                (Platform::Ios, Some(udid)) => Action::IosShutdown(udid.clone()),
-                                _ => Action::Stop(serial.clone()),
-                            });
+                        (State::Running { serial }, platform) => {
+                            if d.is_emulator
+                                && frame::button(ui, frame::Icon::Power, None, true)
+                                    .on_hover_text("Shut down")
+                                    .clicked()
+                            {
+                                actions.push(match (platform, &d.udid) {
+                                    (Platform::Ios, Some(udid)) => {
+                                        Action::IosShutdown(udid.clone())
+                                    }
+                                    _ => Action::Stop(serial.clone()),
+                                });
+                            }
+                            if frame::button(ui, frame::Icon::Open, Some("Open"), false).clicked() {
+                                actions.push(Action::Focus(serial.clone()));
+                            }
                         }
-                        if ui.button("View").clicked() {
-                            actions.push(Action::Focus(serial.clone()));
-                        }
+                        _ => {}
                     }
-                    _ => {}
-                },
-            );
+                });
+            });
         });
-    });
+    ui.add_space(2.0);
 }
 
 impl eframe::App for EmuGrid {

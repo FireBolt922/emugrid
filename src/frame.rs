@@ -148,6 +148,8 @@ pub enum Icon {
     Check,
     VolumeDown,
     VolumeUp,
+    Play,
+    Open,
 }
 
 fn arc(c: Pos2, r: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -239,6 +241,25 @@ pub fn paint_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color3
         }
         Icon::Check => {
             painter.line(vec![p(-0.3, 0.02), p(-0.08, 0.24), p(0.32, -0.22)], stroke);
+        }
+        Icon::Play => {
+            let pts = vec![p(-0.2, -0.32), p(0.3, 0.0), p(-0.2, 0.32)];
+            painter.add(egui::Shape::convex_polygon(pts, color, Stroke::NONE));
+        }
+        Icon::Open => {
+            // A box with an arrow out of its top-right corner.
+            painter.line(
+                vec![
+                    p(0.02, -0.32),
+                    p(-0.32, -0.32),
+                    p(-0.32, 0.32),
+                    p(0.32, 0.32),
+                    p(0.32, -0.02),
+                ],
+                stroke,
+            );
+            painter.line_segment([p(-0.04, 0.04), p(0.36, -0.36)], stroke);
+            painter.line(vec![p(0.1, -0.36), p(0.36, -0.36), p(0.36, -0.1)], stroke);
         }
         Icon::VolumeDown | Icon::VolumeUp => {
             let pts = vec![
