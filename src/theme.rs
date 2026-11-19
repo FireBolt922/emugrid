@@ -50,14 +50,15 @@ pub const DARK: Palette = Palette {
     bg: hex(0x0D0F12),
     chrome: hex(0x121519),
     surface: hex(0x171B21),
-    raised: hex(0x2A313C),
+    raised: hex(0x232933),
     control: hex(0x1E232B),
     popup: hex(0x1B2027),
     border: hex(0x272D36),
     border_strong: hex(0x3A424E),
     text: hex(0xE7EAEE),
     text2: hex(0xA3ACB8),
-    text3: hex(0x848E9B),
+    // Muted copy also sits on raised stream cards and must meet AA there.
+    text3: hex(0x8A94A1),
     accent: hex(0x7EA6FF),
     on_accent: hex(0x0B1220),
     accent_text: hex(0xA9C2FF),
@@ -83,7 +84,8 @@ pub const LIGHT: Palette = Palette {
     border_strong: hex(0xC3C9D1),
     text: hex(0x15181D),
     text2: hex(0x4F5966),
-    text3: hex(0x636D79),
+    // The raised background needs a darker muted text value for AA.
+    text3: hex(0x5F6975),
     accent: hex(0x2F5FD8),
     on_accent: hex(0xFFFFFF),
     accent_text: hex(0x2449B0),
@@ -102,8 +104,10 @@ pub const LIGHT: Palette = Palette {
 pub const BEZEL: Color32 = hex(0x050607);
 
 /// Spacing and radii (points).
+pub const RADIUS_SMALL: u8 = 5;
 pub const RADIUS_CONTROL: u8 = 8;
 pub const RADIUS_CARD: u8 = 14;
+pub const RADIUS_PHONE: u8 = 20;
 
 pub fn palette(ctx: &egui::Context) -> &'static Palette {
     match ctx.theme() {
@@ -138,7 +142,44 @@ impl Tone {
 
 /// Install both themes' styles. The theme preference is left at its
 /// default (follow the system).
+pub fn semibold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("semibold".into()))
+}
+
 pub fn install(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::empty();
+    for (name, bytes) in [
+        (
+            "inter",
+            include_bytes!("../assets/fonts/Inter-Regular.ttf").as_slice(),
+        ),
+        (
+            "inter-semibold",
+            include_bytes!("../assets/fonts/Inter-SemiBold.ttf").as_slice(),
+        ),
+        (
+            "jetbrains",
+            include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf").as_slice(),
+        ),
+    ] {
+        fonts
+            .font_data
+            .insert(name.into(), egui::FontData::from_static(bytes).into());
+    }
+    for (family, stack) in [
+        (FontFamily::Proportional, ["inter", "jetbrains"]),
+        (FontFamily::Monospace, ["jetbrains", "inter"]),
+        (
+            FontFamily::Name("semibold".into()),
+            ["inter-semibold", "jetbrains"],
+        ),
+    ] {
+        fonts
+            .families
+            .insert(family, stack.map(String::from).into());
+    }
+    ctx.set_fonts(fonts);
+
     ctx.set_style_of(Theme::Dark, style(Theme::Dark, &DARK));
     ctx.set_style_of(Theme::Light, style(Theme::Light, &LIGHT));
 }
@@ -150,7 +191,7 @@ fn style(theme: Theme, p: &Palette) -> egui::Style {
     };
     use FontFamily::{Monospace, Proportional};
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(17.0, Proportional)),
+        (TextStyle::Heading, semibold(17.0)),
         (TextStyle::Body, FontId::new(13.0, Proportional)),
         (TextStyle::Button, FontId::new(13.0, Proportional)),
         (TextStyle::Small, FontId::new(11.0, Proportional)),
@@ -174,8 +215,8 @@ fn visuals(theme: Theme, p: &Palette) -> egui::Visuals {
     v.panel_fill = p.chrome;
     v.window_fill = p.popup;
     v.window_stroke = Stroke::new(1.0, p.border_strong);
-    v.window_corner_radius = CornerRadius::same(10);
-    v.menu_corner_radius = CornerRadius::same(10);
+    v.window_corner_radius = CornerRadius::same(RADIUS_CARD);
+    v.menu_corner_radius = CornerRadius::same(RADIUS_CONTROL);
     let shadow = Shadow {
         offset: [0, 8],
         blur: 24,
@@ -228,9 +269,89 @@ fn visuals(theme: Theme, p: &Palette) -> egui::Visuals {
     v
 }
 
+#[cfg(target_os = "linux")]
+pub fn linux_system_theme() -> Option<Theme> {
+    use std::process::Stdio;
+
+    let output = |program: &str, args: &[&str]| {
+        let output = crate::sdk::command(program)
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    if std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some()
+        && let Some(theme) = output(
+            "gdbus",
+            &[
+                "call",
+                "--session",
+                "--timeout",
+                "1",
+                "--dest",
+                "org.freedesktop.portal.Desktop",
+                "--object-path",
+                "/org/freedesktop/portal/desktop",
+                "--method",
+                "org.freedesktop.portal.Settings.Read",
+                "org.freedesktop.appearance",
+                "color-scheme",
+            ],
+        )
+        .as_deref()
+        .and_then(portal_theme)
+    {
+        return Some(theme);
+    }
+    let gsettings = |key| output("gsettings", &["get", "org.gnome.desktop.interface", key]);
+    match gsettings("color-scheme")?.trim() {
+        "'prefer-dark'" => Some(Theme::Dark),
+        "'prefer-light'" => Some(Theme::Light),
+        "'default'"
+            if std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktop| {
+                desktop
+                    .split(':')
+                    .any(|name| name.eq_ignore_ascii_case("GNOME"))
+            }) =>
+        {
+            Some(
+                if gsettings("gtk-theme").is_some_and(|name| name.to_lowercase().contains("dark")) {
+                    Theme::Dark
+                } else {
+                    Theme::Light
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn portal_theme(value: &str) -> Option<Theme> {
+    let value = value.split_once("uint32 ")?.1.split('>').next()?.trim();
+    match value {
+        "1" => Some(Theme::Dark),
+        "2" => Some(Theme::Light),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_xdg_portal_color_preferences() {
+        assert_eq!(portal_theme("(<<uint32 1>>,)"), Some(Theme::Dark));
+        assert_eq!(portal_theme("(<uint32 2>,)"), Some(Theme::Light));
+        assert_eq!(portal_theme("(<uint32 0>,)"), None);
+        assert_eq!(portal_theme("(<uint32 12>,)"), None);
+    }
 
     fn luminance(c: Color32) -> f32 {
         let lin = |v: u8| {
@@ -259,6 +380,8 @@ mod tests {
                     ("chrome", p.chrome),
                     ("surface", p.surface),
                     ("control", p.control),
+                    ("raised", p.raised),
+                    ("popup", p.popup),
                 ] {
                     let c = contrast(fg, bg);
                     assert!(c >= 4.5, "{name}: {fg_name} on {bg_name} is {c:.2}");
@@ -269,6 +392,7 @@ mod tests {
                 let c = contrast(fg, soft);
                 assert!(c >= 4.5, "{name}: {tone:?} pill is {c:.2}");
             }
+            assert!(contrast(p.accent_text, p.accent_soft) >= 4.5);
             let c = contrast(p.on_accent, p.accent);
             assert!(c >= 4.5, "{name}: on_accent is {c:.2}");
             let c = contrast(p.danger, p.surface);

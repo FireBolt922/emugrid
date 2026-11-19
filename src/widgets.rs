@@ -2,7 +2,7 @@
 //! control, keyboard chips, phone bezels.
 
 use crate::icons::{self, Icon};
-use crate::theme::{self, BEZEL, Palette, RADIUS_CONTROL, Tone};
+use crate::theme::{self, BEZEL, Palette, RADIUS_CONTROL, RADIUS_SMALL, Tone};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, CursorIcon, FontId, Painter, Pos2, Rect, Response,
     RichText, Role, Sense, Stroke, StrokeKind, TextureId, Ui, Vec2, WidgetInfo, epaint::RectShape,
@@ -127,47 +127,66 @@ pub fn icon_button(ui: &mut Ui, icon: Icon, tooltip: &str, size: f32, framed: bo
 }
 
 /// The Grid / List style toggle. Returns the index clicked, if any.
-pub fn segmented(ui: &mut Ui, items: &[(Icon, &str)], selected: usize) -> Option<usize> {
+pub fn segmented(
+    ui: &mut Ui,
+    items: &[(Icon, &str)],
+    selected: usize,
+    icon_only: bool,
+) -> Option<usize> {
     let p = pal(ui);
     let mut clicked = None;
     egui::Frame::new()
         .fill(p.bg)
         .stroke(Stroke::new(1.0, p.border))
-        .corner_radius(9)
+        .corner_radius(RADIUS_CONTROL)
         .inner_margin(3)
         .show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.horizontal(|ui| {
                 for (i, (icon, label)) in items.iter().enumerate() {
                     let on = i == selected;
-                    let galley = ui.painter().layout_no_wrap(
-                        (*label).to_owned(),
-                        FontId::proportional(13.0),
-                        Color32::PLACEHOLDER,
-                    );
-                    let size = Vec2::new(galley.size().x + 14.0 + 6.0 + 24.0, 28.0);
-                    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+                    let galley = (!icon_only).then(|| {
+                        ui.painter().layout_no_wrap(
+                            (*label).to_owned(),
+                            theme::semibold(12.0),
+                            Color32::PLACEHOLDER,
+                        )
+                    });
+                    let width = galley.as_ref().map_or(32.0, |text| text.size().x + 44.0);
+                    let (rect, resp) =
+                        ui.allocate_exact_size(Vec2::new(width, 28.0), Sense::click());
                     resp.widget_info(|| WidgetInfo::selected(Role::Button, true, on, *label));
                     if on {
-                        ui.painter().rect_filled(rect, 6, p.raised);
+                        ui.painter().rect_filled(rect, RADIUS_SMALL, p.raised);
                     }
                     let fg = if on || resp.hovered() {
                         p.text
                     } else {
                         p.text2
                     };
-                    let icon_rect = Rect::from_min_size(
-                        Pos2::new(rect.left() + 12.0, rect.center().y - 7.0),
+                    let center_x = if icon_only {
+                        rect.center().x
+                    } else {
+                        rect.left() + 19.0
+                    };
+                    let icon_rect = Rect::from_center_size(
+                        Pos2::new(center_x, rect.center().y),
                         Vec2::splat(14.0),
                     );
                     icons::paint(ui.painter(), icon_rect, *icon, fg);
-                    let pos = Pos2::new(
-                        icon_rect.right() + 6.0,
-                        rect.center().y - galley.size().y / 2.0,
-                    );
-                    ui.painter().galley(pos, galley, fg);
+                    if let Some(galley) = galley {
+                        let pos = Pos2::new(
+                            icon_rect.right() + 6.0,
+                            rect.center().y - galley.size().y / 2.0,
+                        );
+                        ui.painter().galley(pos, galley, fg);
+                    }
                     // Clicking the selected one counts too: "Grid" also leaves the focused view.
-                    if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    if resp
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(*label)
+                        .clicked()
+                    {
                         clicked = Some(i);
                     }
                 }
@@ -231,7 +250,7 @@ pub fn kbd(ui: &mut Ui, text: &str) -> Response {
     let painter = ui.painter();
     painter.rect(
         rect,
-        5,
+        RADIUS_SMALL,
         p.control,
         Stroke::new(1.0, p.border),
         StrokeKind::Inside,
@@ -269,7 +288,12 @@ pub fn tag_size(painter: &Painter, text: &str) -> Vec2 {
 }
 
 pub fn paint_tag(painter: &Painter, p: &Palette, rect: Rect, text: &str) {
-    painter.rect_stroke(rect, 5, Stroke::new(1.0, p.border), StrokeKind::Inside);
+    painter.rect_stroke(
+        rect,
+        RADIUS_SMALL,
+        Stroke::new(1.0, p.border),
+        StrokeKind::Inside,
+    );
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
@@ -311,7 +335,7 @@ pub fn paint_rounded_texture(painter: &Painter, tex: TextureId, rect: Rect, radi
 }
 
 /// The app mark (2×2 rounded squares) and name.
-pub fn wordmark(ui: &mut Ui) {
+pub fn wordmark(ui: &mut Ui, compact: bool) {
     let p = pal(ui);
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
     let cell = 8.0;
@@ -323,13 +347,15 @@ pub fn wordmark(ui: &mut Ui) {
             p.accent.gamma_multiply(alpha),
         );
     }
-    ui.label(
-        RichText::new("emugrid")
-            .monospace()
-            .size(14.0)
-            .color(p.text)
-            .strong(),
-    );
+    if !compact {
+        ui.label(
+            RichText::new("emugrid")
+                .monospace()
+                .size(14.0)
+                .color(p.text)
+                .strong(),
+        );
+    }
 }
 
 /// A primary "Start" button joined to a chevron that opens `menu`.

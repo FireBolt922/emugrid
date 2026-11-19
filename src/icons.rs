@@ -28,11 +28,20 @@ pub enum Icon {
     Keyboard,
     Phone,
     Warning,
+    Search,
+    Folder,
+    Copy,
+    Check,
+    Close,
+    Info,
+    Menu,
+    Sidebar,
+    TileSize,
 }
 
 impl Icon {
     #[cfg(test)]
-    pub const ALL: [Icon; 19] = [
+    pub const ALL: [Icon; 28] = [
         Icon::Grid,
         Icon::List,
         Icon::Refresh,
@@ -52,6 +61,15 @@ impl Icon {
         Icon::Keyboard,
         Icon::Phone,
         Icon::Warning,
+        Icon::Search,
+        Icon::Folder,
+        Icon::Copy,
+        Icon::Check,
+        Icon::Close,
+        Icon::Info,
+        Icon::Menu,
+        Icon::Sidebar,
+        Icon::TileSize,
     ];
 }
 
@@ -138,6 +156,43 @@ impl Grid {
 pub fn shapes(icon: Icon, rect: Rect, color: Color32) -> Vec<Shape> {
     let g = Grid::new(rect, color);
     match icon {
+        Icon::Search => vec![
+            g.circle(10.0, 10.0, 6.0),
+            g.line(&[(14.5, 14.5), (20.0, 20.0)]),
+        ],
+        Icon::Folder => vec![g.closed(&[
+            (3.0, 6.0),
+            (10.0, 6.0),
+            (13.0, 9.0),
+            (21.0, 9.0),
+            (21.0, 19.0),
+            (3.0, 19.0),
+        ])],
+        Icon::Copy => vec![
+            g.rect(8.0, 8.0, 20.0, 21.0, 2.0),
+            g.line(&[(4.0, 16.0), (4.0, 3.0), (16.0, 3.0)]),
+        ],
+        Icon::Check => vec![g.line(&[(5.0, 12.0), (10.0, 17.0), (20.0, 7.0)])],
+        Icon::Close => vec![
+            g.line(&[(6.0, 6.0), (18.0, 18.0)]),
+            g.line(&[(18.0, 6.0), (6.0, 18.0)]),
+        ],
+        Icon::Info => vec![
+            g.circle(12.0, 12.0, 9.0),
+            g.dot(12.0, 8.0, 1.2),
+            g.line(&[(12.0, 11.0), (12.0, 16.5)]),
+        ],
+        Icon::Menu => [6.0, 12.0, 18.0]
+            .map(|y| g.line(&[(4.0, y), (20.0, y)]))
+            .to_vec(),
+        Icon::Sidebar => vec![
+            g.rect(3.0, 4.0, 21.0, 20.0, 2.0),
+            g.line(&[(9.0, 4.0), (9.0, 20.0)]),
+        ],
+        Icon::TileSize => vec![
+            g.rect(3.0, 9.0, 10.0, 16.0, 1.0),
+            g.rect(13.0, 5.0, 21.0, 20.0, 1.0),
+        ],
         Icon::Grid => vec![
             g.rect(3.0, 3.0, 10.0, 10.0, 1.5),
             g.rect(14.0, 3.0, 21.0, 10.0, 1.5),
