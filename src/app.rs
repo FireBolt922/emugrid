@@ -3,9 +3,12 @@
 
 use crate::capture::{self, Manager, Source, grpc};
 use crate::devices::{self, Boot, Device, Platform, State};
+use crate::icons::{self, Icon};
 use crate::sdk::Sdk;
+use crate::theme::{self, RADIUS_CARD, Tone};
+use crate::widgets::{self, Kind};
 use crate::{grid, input};
-use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Vec2};
+use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, Vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -15,13 +18,19 @@ use std::time::{Duration, Instant};
 
 const REFRESH_EVERY: Duration = Duration::from_secs(3);
 const SCROLL_SETTLE: Duration = Duration::from_millis(150);
-const TILE_WIDTH: f32 = 190.0;
+const TILE_WIDTH: f32 = 200.0;
+/// Padding inside a tile card.
+const TILE_PAD: f32 = 12.0;
+const TILE_HEADER: f32 = 40.0;
+const TILE_FOOTER: f32 = 24.0;
+/// Everything in a tile that is not the screen: padding, header, footer,
+/// gaps and the phone frame.
+const TILE_CHROME: f32 = TILE_PAD * 2.0 + TILE_HEADER + TILE_FOOTER + 16.0 + 8.0;
+/// Horizontal space a tile takes around the screen (padding + phone frame).
+const TILE_SIDES: f32 = TILE_PAD * 2.0 + 8.0;
 const GAP: f32 = 12.0;
 /// Phone-shaped screen box used before the first frame arrives.
 const DEFAULT_ASPECT: f32 = 2400.0 / 1080.0;
-
-const GREEN: Color32 = Color32::from_rgb(60, 180, 90);
-const AMBER: Color32 = Color32::from_rgb(220, 160, 40);
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
@@ -388,13 +397,15 @@ impl EmuGrid {
                             .serial()
                             .and_then(|s| self.screens.get(s))
                             .map_or(DEFAULT_ASPECT, Screen::aspect);
-                        (tile_w - 8.0) * aspect.clamp(0.4, 2.4)
+                        (tile_w - TILE_SIDES) * aspect.clamp(0.4, 2.4)
                     })
                     .fold(0.0, f32::max);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = GAP;
                     for d in row {
-                        if let Some(a) = self.tile(ui, d, Vec2::new(tile_w, screen_h + 46.0), ppp) {
+                        if let Some(a) =
+                            self.tile(ui, d, Vec2::new(tile_w, screen_h + TILE_CHROME), ppp)
+                        {
                             actions.push(a);
                         }
                     }
@@ -411,97 +422,220 @@ impl EmuGrid {
             return None;
         }
         self.visible.insert(serial.clone());
-        let visuals = ui.visuals();
-        let painter = ui.painter_at(rect);
-        let stroke = if resp.hovered() {
-            visuals.selection.stroke
+        let p = widgets::pal(ui);
+        let painter = ui.painter_at(rect.expand(3.0));
+        if resp.hovered() {
+            painter.rect_stroke(
+                rect.expand(1.5),
+                RADIUS_CARD + 2,
+                Stroke::new(3.0, p.accent_soft),
+                StrokeKind::Outside,
+            );
+        }
+        let (edge, width) = if resp.hovered() {
+            (p.accent, 1.5)
         } else {
-            visuals.widgets.noninteractive.bg_stroke
+            (p.border, 1.0)
         };
         painter.rect(
             rect,
-            8.0,
-            visuals.faint_bg_color,
-            stroke,
-            egui::StrokeKind::Inside,
+            RADIUS_CARD,
+            p.surface,
+            Stroke::new(width, edge),
+            StrokeKind::Inside,
         );
+        let inner = rect.shrink(TILE_PAD);
 
-        // Title.
-        let text = visuals.text_color();
-        painter.text(
-            rect.left_top() + Vec2::new(10.0, 8.0),
-            Align2::LEFT_TOP,
+        // Header: name and kind on the left, status pill on the right.
+        let control = self.capture.control(&serial);
+        let (label, tone) = status_badge(d, control.map(|c| c.live.load(Ordering::Relaxed)));
+        let pill = widgets::pill_size(&painter, &label);
+        let pill_rect = Rect::from_min_size(Pos2::new(inner.right() - pill.x, inner.top()), pill);
+        widgets::paint_pill(&painter, p, pill_rect, &label, tone);
+        let name = widgets::truncated(
+            &painter,
             self.label(d),
             FontId::proportional(13.0),
-            text,
+            p.text,
+            (inner.width() - pill.x - 8.0).max(20.0),
         );
+        painter.galley(inner.left_top(), name, p.text);
+        let kind = widgets::truncated(
+            &painter,
+            device_kind(d),
+            FontId::proportional(11.0),
+            p.text3,
+            inner.width(),
+        );
+        painter.galley(inner.left_top() + Vec2::new(0.0, 18.0), kind, p.text3);
 
-        // Screen.
-        let screen_box = Rect::from_min_max(
-            rect.left_top() + Vec2::new(4.0, 26.0),
-            rect.right_bottom() - Vec2::new(4.0, 20.0),
+        // Screen in a phone frame.
+        let frame = Rect::from_min_max(
+            Pos2::new(inner.left(), inner.top() + TILE_HEADER + 8.0),
+            Pos2::new(inner.right(), inner.bottom() - TILE_FOOTER - 8.0),
         );
-        let control = self.capture.control(&serial);
+        let (screen_box, radius) = widgets::bezel(&painter, p, frame, 18.0);
         if let Some(c) = control {
             c.size.store(
                 grid::bucket(screen_box.height().max(screen_box.width()) * ppp),
                 Ordering::Relaxed,
             );
         }
-        let img = self.paint_screen(&painter, &serial, screen_box);
-
-        // Status line.
-        let (label, color) = status_badge(d, control.map(|c| c.live.load(Ordering::Relaxed)));
-        painter.text(
-            Pos2::new(rect.left() + 10.0, rect.bottom() - 10.0),
-            Align2::LEFT_CENTER,
-            format!("⚫ {label}"),
-            FontId::proportional(11.0),
-            color,
-        );
+        let img = self.paint_screen(&painter, &serial, screen_box, radius);
         if img.is_none() {
-            painter.text(
-                screen_box.center(),
-                Align2::CENTER_CENTER,
-                "waiting for screen…",
-                FontId::proportional(12.0),
-                visuals.weak_text_color(),
+            egui::Spinner::new().size(22.0).color(p.text3).paint_at(
+                ui,
+                Rect::from_center_size(screen_box.center(), Vec2::splat(22.0)),
             );
         }
-        resp.on_hover_text("Click to open")
+
+        // Footer: serial on the left, how the screen arrives on the right.
+        let mid = inner.bottom() - TILE_FOOTER / 2.0;
+        let transport = match (d.platform, control.map(|c| c.live.load(Ordering::Relaxed))) {
+            (Platform::Ios, _) => "simctl",
+            (_, Some(true)) => "gRPC",
+            _ => "adb · PNG",
+        };
+        let tag = widgets::tag_size(&painter, transport);
+        widgets::paint_tag(
+            &painter,
+            p,
+            Rect::from_min_size(Pos2::new(inner.right() - tag.x, mid - tag.y / 2.0), tag),
+            transport,
+        );
+        let id = widgets::truncated(
+            &painter,
+            serial.clone(),
+            FontId::monospace(11.0),
+            p.text3,
+            (inner.width() - tag.x - 8.0).max(20.0),
+        );
+        painter.galley(
+            Pos2::new(inner.left(), mid - id.size().y / 2.0),
+            id,
+            p.text3,
+        );
+
+        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("Click to open")
             .clicked()
             .then_some(Action::Focus(serial))
     }
 
-    /// Draw the latest frame fitted into `area`. Returns where it was drawn.
-    fn paint_screen(&self, painter: &egui::Painter, serial: &str, area: Rect) -> Option<Rect> {
+    /// Where the latest frame lands when fitted into `area`.
+    fn screen_rect(&self, serial: &str, area: Rect) -> Option<Rect> {
         let screen = self.screens.get(serial)?;
         let [w, h] = screen.size.map(|v| v as f32);
         let scale = (area.width() / w).min(area.height() / h);
-        let rect = Rect::from_center_size(area.center(), Vec2::new(w, h) * scale);
-        painter.image(
-            screen.tex.id(),
-            rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        Some(Rect::from_center_size(
+            area.center(),
+            Vec2::new(w, h) * scale,
+        ))
+    }
+
+    /// Draw the latest frame fitted into `area` with rounded corners.
+    /// Returns where it was drawn.
+    fn paint_screen(
+        &self,
+        painter: &egui::Painter,
+        serial: &str,
+        area: Rect,
+        radius: f32,
+    ) -> Option<Rect> {
+        let rect = self.screen_rect(serial, area)?;
+        let screen = self.screens.get(serial)?;
+        widgets::paint_rounded_texture(painter, screen.tex.id(), rect, radius);
         Some(rect)
     }
 
     fn empty_grid(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        ui.add_space(24.0);
+        let p = widgets::pal(ui);
+        ui.add_space(32.0);
         ui.vertical_centered(|ui| {
-            ui.heading("No running devices");
-            ui.label("Start an emulator and its screen shows up here.");
-            ui.add_space(12.0);
-            for d in self.devices.iter().filter(|d| d.avd.is_some()).take(8) {
-                if ui.button(format!("▶ {}", d.name)).clicked() {
-                    actions.push(Action::Start(
-                        d.avd.clone().unwrap_or_default(),
-                        Boot::Normal,
-                    ));
-                }
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(132.0, 78.0), Sense::hover());
+            let painter = ui.painter();
+            for (i, (x, y, w, h)) in [
+                (8.0, 14.0, 30.0, 58.0),
+                (51.0, 4.0, 30.0, 64.0),
+                (94.0, 14.0, 30.0, 58.0),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let color = if i == 1 { p.accent } else { p.border_strong };
+                painter.rect_stroke(
+                    Rect::from_min_size(rect.min + Vec2::new(x, y), Vec2::new(w, h)),
+                    7,
+                    Stroke::new(2.0, color),
+                    StrokeKind::Inside,
+                );
             }
+            icons::paint(
+                painter,
+                Rect::from_center_size(rect.min + Vec2::new(66.0, 36.0), Vec2::splat(16.0)),
+                Icon::Play,
+                p.accent,
+            );
+            ui.add_space(8.0);
+            ui.heading("No devices running");
+            ui.label(
+                RichText::new("Start an emulator and its screen shows up here.").color(p.text2),
+            );
+            ui.add_space(12.0);
+
+            let avds: Vec<&Device> = self
+                .devices
+                .iter()
+                .filter(|d| d.avd.is_some())
+                .take(8)
+                .collect();
+            let width = ui.available_width().min(560.0);
+            ui.allocate_ui_with_layout(
+                Vec2::new(width, 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.columns(2, |cols| {
+                        for (i, d) in avds.iter().enumerate() {
+                            let ui = &mut cols[i % 2];
+                            egui::Frame::new()
+                                .fill(p.surface)
+                                .stroke(Stroke::new(1.0, p.border))
+                                .corner_radius(10)
+                                .inner_margin(10)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        widgets::icon(ui, Icon::Phone, 18.0, p.text3);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if widgets::button(
+                                                    ui,
+                                                    Kind::Secondary,
+                                                    Some(Icon::Play),
+                                                    "Start",
+                                                )
+                                                .clicked()
+                                                {
+                                                    actions.push(Action::Start(
+                                                        d.avd.clone().unwrap_or_default(),
+                                                        Boot::Normal,
+                                                    ));
+                                                }
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&d.name).strong(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            },
+                                        );
+                                    });
+                                });
+                        }
+                    });
+                },
+            );
             if self.devices.iter().any(|d| d.platform == Platform::Ios) {
                 ui.add_space(8.0);
                 if ui.link("iOS simulators are in the List view").clicked() {
@@ -522,18 +656,34 @@ impl EmuGrid {
         }
         let shell = |cmd: &str| Action::Shell(serial.to_string(), cmd.to_string());
 
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("⬅ Grid").on_hover_text("Esc").clicked() {
+        let p = widgets::pal(ui);
+        let live = self
+            .capture
+            .control(serial)
+            .map(|c| c.live.load(Ordering::Relaxed));
+        let (badge, tone) = status_badge(&d, live);
+        let others: Vec<(String, String)> = self
+            .running()
+            .filter_map(|o| Some((o.serial()?.to_string(), self.label(o))))
+            .collect();
+        let current = self.label(&d);
+
+        let compact = ui.available_width() < 850.0;
+        let switch_width = if compact {
+            (ui.available_width() - 185.0).clamp(80.0, 220.0)
+        } else {
+            220.0
+        };
+        ui.horizontal(|ui| {
+            if widgets::button(ui, Kind::Ghost, Some(Icon::ChevronLeft), "Grid")
+                .on_hover_text("Esc")
+                .clicked()
+            {
                 actions.push(Action::Unfocus);
             }
-            let current = self.label(&d);
-            let others: Vec<(String, String)> = self
-                .running()
-                .filter_map(|o| Some((o.serial()?.to_string(), self.label(o))))
-                .collect();
             egui::ComboBox::from_id_salt("device-switch")
-                .selected_text(egui::RichText::new(current).strong())
-                .width(240.0)
+                .selected_text(RichText::new(current).strong())
+                .width(switch_width)
                 .show_ui(ui, |ui| {
                     for (s, name) in others {
                         if ui.selectable_label(s == serial, name).clicked() && s != serial {
@@ -543,59 +693,33 @@ impl EmuGrid {
                 })
                 .response
                 .on_hover_text("Switch device");
-            let live = self
-                .capture
-                .control(serial)
-                .map(|c| c.live.load(Ordering::Relaxed));
-            let (label, color) = status_badge(&d, live);
-            ui.colored_label(color, format!("⚫ {label}"));
-            ui.separator();
-            if android {
-                for (label, key, tip) in [
-                    ("◀ Back", 4, "Back"),
-                    ("🏠 Home", 3, "Home"),
-                    ("▣ Recents", 187, "Recent apps"),
-                    ("🔉", 25, "Volume down"),
-                    ("🔊", 24, "Volume up"),
-                    ("⚡ Power", 26, "Power button"),
-                ] {
-                    if ui.button(label).on_hover_text(tip).clicked() {
-                        actions.push(shell(&format!("input keyevent {key}")));
-                    }
-                }
-                if d.is_emulator
-                    && ui
-                        .button("⟳ Rotate")
-                        .on_hover_text("Rotate the emulator")
-                        .clicked()
-                {
-                    actions.push(Action::Rotate(serial.to_string()));
-                }
-            } else if let Some(udid) = &d.udid
-                && ui.button("Open in Simulator").clicked()
-            {
-                actions.push(Action::IosOpen(udid.clone()));
-            }
-            if ui
-                .button("📷 Screenshot")
-                .on_hover_text("Save screenshot to Desktop")
-                .clicked()
-            {
-                actions.push(Action::Screenshot(serial.to_string()));
-            }
-            if d.is_emulator && ui.button("■ Stop").clicked() {
-                actions.push(match &d.udid {
-                    Some(udid) => Action::IosShutdown(udid.clone()),
-                    None => Action::Stop(serial.to_string()),
+            widgets::status_pill(ui, &badge, tone);
+            if !compact {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    focused_toolbar_controls(ui, &d, serial, actions);
                 });
             }
         });
+        if compact {
+            ui.horizontal_wrapped(|ui| focused_toolbar_controls(ui, &d, serial, actions));
+        }
         ui.add_space(4.0);
 
-        let hint_h = 18.0;
+        let hint_h = if android && ui.available_width() < 700.0 {
+            76.0
+        } else {
+            28.0
+        };
+        let rail_w = if android { 64.0 } else { 0.0 };
         let area = ui.available_rect_before_wrap();
-        let area = Rect::from_min_max(area.min, area.max - Vec2::new(0.0, hint_h));
-        let (rect, resp) = ui.allocate_exact_size(area.size(), Sense::click_and_drag());
+        let area = Rect::from_min_max(
+            area.min,
+            Pos2::new(area.right(), (area.bottom() - hint_h).max(area.top())),
+        );
+        ui.painter()
+            .rect_filled(area, 12, p.bg.lerp_to_gamma(Color32::BLACK, 0.10));
+        let phone_area = Rect::from_min_max(area.min, area.max - Vec2::new(rail_w, 0.0));
+        let (rect, resp) = ui.allocate_exact_size(phone_area.size(), Sense::click_and_drag());
         let ppp = ui.ctx().pixels_per_point();
         if let Some(c) = self.capture.control(serial) {
             c.size.store(
@@ -605,16 +729,141 @@ impl EmuGrid {
         }
         self.visible.insert(serial.to_string());
         let painter = ui.painter_at(rect);
-        let img = self.paint_screen(&painter, serial, rect);
+        let frame_radius = 34.0;
+        let pad = widgets::bezel_pad(frame_radius);
+        let inset = (pad + 6.0).min((rect.width().min(rect.height()) / 2.0).max(0.0));
+        let screen_area = rect.shrink(inset);
+        let fit = self.screen_rect(serial, screen_area).unwrap_or_else(|| {
+            let height = screen_area
+                .height()
+                .max(0.0)
+                .min(screen_area.width().max(0.0) * DEFAULT_ASPECT);
+            Rect::from_center_size(
+                screen_area.center(),
+                Vec2::new(height / DEFAULT_ASPECT, height),
+            )
+        });
+        let frame = fit.expand(pad);
+        let (inner, radius) = widgets::bezel(&painter, p, frame, frame_radius);
+        let img = self.paint_screen(&painter, serial, inner, radius);
         if img.is_none() {
-            ui.put(rect, egui::Spinner::new());
+            egui::Spinner::new().size(24.0).color(p.text3).paint_at(
+                ui,
+                Rect::from_center_size(inner.center(), Vec2::splat(24.0)),
+            );
         }
+
+        // Control rail next to the phone (Android).
+        if android {
+            let items = if d.is_emulator { 9.0 } else { 8.0 };
+            let height = (items * 44.0 + 3.0 * 9.0 + 12.0_f32).min(area.height().max(0.0));
+            let top = (area.center().y - height / 2.0).max(area.top());
+            let rail_rect = Rect::from_min_size(
+                Pos2::new(
+                    (frame.right() + 20.0).min(area.right() - (rail_w - 8.0)),
+                    top,
+                ),
+                Vec2::new(rail_w - 8.0, height),
+            );
+            let mut rail = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rail_rect)
+                    .layout(egui::Layout::top_down(egui::Align::Center)),
+            );
+            egui::Frame::new()
+                .fill(p.surface)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(RADIUS_CARD)
+                .inner_margin(6)
+                .show(&mut rail, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("focused-control-rail")
+                        .max_height((height - 12.0).max(0.0))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            let sep = |ui: &mut egui::Ui| {
+                                let (r, _) =
+                                    ui.allocate_exact_size(Vec2::new(28.0, 9.0), Sense::hover());
+                                ui.painter().hline(
+                                    r.x_range(),
+                                    r.center().y,
+                                    Stroke::new(1.0, p.border),
+                                );
+                            };
+                            let groups: [&[(Icon, &str, u32)]; 3] = [
+                                &[
+                                    (Icon::Back, "Back", 4),
+                                    (Icon::Home, "Home", 3),
+                                    (Icon::Recents, "Recent apps", 187),
+                                ],
+                                &[
+                                    (Icon::VolumeDown, "Volume down", 25),
+                                    (Icon::VolumeUp, "Volume up", 24),
+                                ],
+                                &[(Icon::Power, "Power", 26)],
+                            ];
+                            for (i, group) in groups.iter().enumerate() {
+                                if i > 0 {
+                                    sep(ui);
+                                }
+                                for &(icon, tip, code) in group.iter() {
+                                    if widgets::icon_button(ui, icon, tip, 40.0, false).clicked() {
+                                        actions.push(shell(&format!("input keyevent {code}")));
+                                    }
+                                }
+                                if i == 2
+                                    && d.is_emulator
+                                    && widgets::icon_button(
+                                        ui,
+                                        Icon::Rotate,
+                                        "Rotate the emulator",
+                                        40.0,
+                                        false,
+                                    )
+                                    .clicked()
+                                {
+                                    actions.push(Action::Rotate(serial.to_string()));
+                                }
+                            }
+                            sep(ui);
+                            if widgets::icon_button(
+                                ui,
+                                Icon::Camera,
+                                "Save screenshot to Desktop",
+                                40.0,
+                                false,
+                            )
+                            .clicked()
+                            {
+                                actions.push(Action::Screenshot(serial.to_string()));
+                            }
+                        });
+                });
+        }
+
         ui.vertical_centered(|ui| {
-            ui.small(if android {
-                "click = tap · drag = swipe · hold = long press, then drag to move · type to send keys · Esc = back"
+            if android {
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (key, description) in [
+                        ("Click", "tap"),
+                        ("Drag", "swipe"),
+                        ("Hold", "long press, then drag to move"),
+                        ("Type", "send keys"),
+                        ("Esc", "back"),
+                    ] {
+                        widgets::kbd(ui, key);
+                        ui.label(RichText::new(description).size(11.0).color(p.text3));
+                        ui.add_space(4.0);
+                    }
+                });
             } else {
-                "View only — use “Open in Simulator” to interact"
-            });
+                ui.label(
+                    RichText::new("View only — use “Open in Simulator” to interact")
+                        .size(11.0)
+                        .color(p.text3),
+                );
+            }
         });
 
         // Input (Android only).
@@ -755,18 +1004,21 @@ impl EmuGrid {
     }
 
     fn list_view(&self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
+        let p = widgets::pal(ui);
         egui::ScrollArea::vertical().show(ui, |ui| {
-            let android: Vec<&Device> = self
-                .devices
-                .iter()
-                .filter(|d| d.platform == Platform::Android)
-                .collect();
-            if android.is_empty() && !self.scanning {
-                ui.label("No Android emulators or devices found.");
+            let of = |platform: Platform, emulator: bool| -> Vec<&Device> {
+                self.devices
+                    .iter()
+                    .filter(|d| d.platform == platform && d.is_emulator == emulator)
+                    .collect()
+            };
+            let emulators = of(Platform::Android, true);
+            let physical = of(Platform::Android, false);
+            if emulators.is_empty() && physical.is_empty() && !self.scanning {
+                ui.label(RichText::new("No Android emulators or devices found.").color(p.text2));
             }
-            for d in android {
-                device_row(ui, d, actions);
-            }
+            device_group(ui, "Android emulators", &emulators, actions);
+            device_group(ui, "Physical devices", &physical, actions);
 
             let ios: Vec<&Device> = self
                 .devices
@@ -782,106 +1034,257 @@ impl EmuGrid {
                 ))
                 .default_open(booted > 0 || ios.len() <= 6)
                 .show(ui, |ui| {
-                    for d in ios {
-                        device_row(ui, d, actions);
-                    }
+                    device_rows(ui, &ios, actions);
                 });
             } else if cfg!(target_os = "macos") && !self.sdk.simctl {
                 ui.add_space(8.0);
-                ui.small("iOS simulators: install Xcode to see and control them here.");
+                ui.label(
+                    RichText::new("iOS simulators: install Xcode to see and control them here.")
+                        .size(11.0)
+                        .color(p.text3),
+                );
             }
         });
     }
 }
 
-/// Short status for a running device: how its screen is being captured.
-fn status_badge(d: &Device, live: Option<bool>) -> (String, Color32) {
-    match (&d.state, live) {
-        (State::Running { .. }, Some(true)) => ("live".into(), GREEN),
-        (State::Running { .. }, Some(false)) => {
-            let kind = match (d.platform, d.is_emulator) {
-                (Platform::Ios, _) => "simulator",
-                (_, true) => "emulator",
-                (_, false) => "device",
-            };
-            (format!("{kind} · ~2 fps"), AMBER)
+fn focused_toolbar_controls(
+    ui: &mut egui::Ui,
+    d: &Device,
+    serial: &str,
+    actions: &mut Vec<Action>,
+) {
+    let p = widgets::pal(ui);
+    let android = d.platform == Platform::Android;
+    if d.is_emulator && widgets::button(ui, Kind::Danger, Some(Icon::Stop), "Stop").clicked() {
+        actions.push(match &d.udid {
+            Some(udid) => Action::IosShutdown(udid.clone()),
+            None => Action::Stop(serial.to_string()),
+        });
+    }
+    if widgets::icon_button(ui, Icon::Camera, "Save screenshot to Desktop", 32.0, true).clicked() {
+        actions.push(Action::Screenshot(serial.to_string()));
+    }
+    if android {
+        egui::Frame::new()
+            .fill(p.accent_soft)
+            .stroke(Stroke::new(1.0, p.accent.gamma_multiply(0.5)))
+            .corner_radius(255)
+            .inner_margin(egui::Margin::symmetric(12, 4))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    widgets::icon(ui, Icon::Keyboard, 15.0, p.accent_text);
+                    ui.label(
+                        RichText::new("Typing goes to the device")
+                            .size(12.0)
+                            .color(p.accent_text),
+                    );
+                    widgets::kbd(ui, "Esc");
+                    ui.label(RichText::new("to leave").size(12.0).color(p.accent_text));
+                });
+            });
+    } else {
+        if let Some(udid) = &d.udid
+            && widgets::button(ui, Kind::Secondary, None, "Open in Simulator").clicked()
+        {
+            actions.push(Action::IosOpen(udid.clone()));
         }
-        (State::Running { .. }, None) => ("starting".into(), AMBER),
-        (State::Other { status, .. }, _) => (status.clone(), AMBER),
-        (State::Stopped, _) => ("stopped".into(), Color32::GRAY),
     }
 }
 
-fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            let (dot, color) = match &d.state {
-                State::Running { .. } => ("⚫", GREEN),
-                State::Other { .. } => ("⚫", AMBER),
-                State::Stopped => ("○", ui.visuals().weak_text_color()),
-            };
-            ui.colored_label(color, dot);
-            ui.vertical(|ui| {
-                ui.strong(&d.name);
-                let kind = match (d.platform, d.is_emulator) {
-                    (Platform::Ios, _) => {
-                        format!("iOS simulator · {}", d.runtime.as_deref().unwrap_or("iOS"))
-                    }
-                    (_, true) => "Emulator".into(),
-                    (_, false) => "Physical device".into(),
-                };
-                let detail = match &d.state {
-                    State::Running { serial } if d.platform == Platform::Ios => {
-                        format!("{kind} · booted")
-                    }
-                    State::Running { serial } => format!("{kind} · running · {serial}"),
-                    State::Other { serial, status } => format!("{kind} · {status} · {serial}"),
-                    State::Stopped => format!("{kind} · stopped"),
-                };
-                ui.small(detail);
-            });
-            ui.with_layout(
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| match (&d.state, d.platform) {
-                    (State::Stopped, Platform::Android) => {
-                        if let Some(avd) = &d.avd {
-                            ui.menu_button("…", |ui| {
-                                if ui.button("Cold boot").clicked() {
-                                    actions.push(Action::Start(avd.clone(), Boot::Cold));
-                                }
-                                if ui.button("Wipe data and start").clicked() {
-                                    actions.push(Action::Start(avd.clone(), Boot::Wipe));
-                                }
-                            });
-                            if ui.button("▶ Start").clicked() {
-                                actions.push(Action::Start(avd.clone(), Boot::Normal));
-                            }
-                        }
-                    }
-                    (State::Stopped, Platform::Ios) => {
-                        if let Some(udid) = &d.udid
-                            && ui.button("▶ Boot").clicked()
-                        {
-                            actions.push(Action::IosBoot(udid.clone()));
-                        }
-                    }
-                    (State::Running { serial }, platform) => {
-                        if d.is_emulator && ui.button("■ Stop").clicked() {
-                            actions.push(match (platform, &d.udid) {
-                                (Platform::Ios, Some(udid)) => Action::IosShutdown(udid.clone()),
-                                _ => Action::Stop(serial.clone()),
-                            });
-                        }
-                        if ui.button("View").clicked() {
-                            actions.push(Action::Focus(serial.clone()));
-                        }
-                    }
-                    _ => {}
-                },
-            );
+/// What a device is, in a few words.
+fn device_kind(d: &Device) -> String {
+    match (d.platform, d.is_emulator) {
+        (Platform::Ios, _) => format!("iOS simulator · {}", d.runtime.as_deref().unwrap_or("iOS")),
+        (_, true) => "Android emulator".into(),
+        (_, false) => "USB device".into(),
+    }
+}
+
+/// Short status for a running device: how its screen is being captured.
+fn status_badge(d: &Device, live: Option<bool>) -> (String, Tone) {
+    match (&d.state, live) {
+        (State::Running { .. }, Some(true)) => ("LIVE".into(), Tone::Live),
+        (State::Running { .. }, Some(false)) => ("2 FPS".into(), Tone::Polled),
+        (State::Running { .. }, None) => ("STARTING".into(), Tone::Busy),
+        (State::Other { status, .. }, _) => (status.to_uppercase(), Tone::Busy),
+        (State::Stopped, _) => ("STOPPED".into(), Tone::Stopped),
+    }
+}
+
+/// A titled, rounded group of device rows.
+fn device_group(ui: &mut egui::Ui, title: &str, rows: &[&Device], actions: &mut Vec<Action>) {
+    if rows.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    widgets::section_label(ui, &format!("{title} · {}", rows.len()));
+    device_rows(ui, rows, actions);
+}
+
+// Shared column rectangles keep headings and values aligned at every width.
+fn device_columns(rect: Rect) -> [Rect; 4] {
+    let width = rect.width();
+    let actions = 175.0_f32.min(width * 0.48);
+    let state = 105.0_f32.min((width - actions) * 0.55);
+    let serial = if width > 600.0 {
+        160.0_f32.min((width - actions - state) * 0.4)
+    } else {
+        0.0
+    };
+    let x = [
+        rect.left(),
+        rect.right() - actions - serial - state,
+        rect.right() - actions - serial,
+        rect.right() - actions,
+        rect.right(),
+    ];
+    std::array::from_fn(|i| {
+        Rect::from_min_max(
+            Pos2::new(x[i], rect.top()),
+            Pos2::new(x[i + 1], rect.bottom()),
+        )
+    })
+}
+
+fn device_rows(ui: &mut egui::Ui, rows: &[&Device], actions: &mut Vec<Action>) {
+    let p = widgets::pal(ui);
+    egui::Frame::new()
+        .fill(p.surface)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(12)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let (header, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.0), Sense::hover());
+            let columns = device_columns(header);
+            for (rect, title) in columns
+                .into_iter()
+                .zip(["Device", "State", "Serial", "Actions"])
+            {
+                if rect.width() > 0.0 {
+                    let mut cell = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(rect.shrink2(Vec2::new(8.0, 0.0)))
+                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    );
+                    widgets::section_label(&mut cell, title);
+                }
+            }
+            for d in rows {
+                let (r, _) =
+                    ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                ui.painter().rect_filled(r, 0, p.border);
+                device_row(ui, d, actions);
+            }
         });
+}
+
+fn device_row(ui: &mut egui::Ui, d: &Device, actions: &mut Vec<Action>) {
+    let p = widgets::pal(ui);
+    let (pill, tone) = match &d.state {
+        State::Running { .. } if d.platform == Platform::Ios => ("BOOTED".to_string(), Tone::Live),
+        State::Running { .. } => ("RUNNING".to_string(), Tone::Live),
+        State::Other { status, .. } => (status.to_uppercase(), Tone::Busy),
+        State::Stopped => ("STOPPED".to_string(), Tone::Stopped),
+    };
+    let (dot, _) = tone.colors(p);
+    let serial = match &d.state {
+        State::Running { serial } | State::Other { serial, .. } => serial.as_str(),
+        State::Stopped => "—",
+    };
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 58.0), Sense::hover());
+    let columns = device_columns(row);
+    let mut device = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(columns[0].shrink2(Vec2::new(8.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    let (r, _) = device.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+    widgets::paint_dot(device.painter(), r.center(), dot, tone == Tone::Stopped);
+    device.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 2.0;
+        ui.add(egui::Label::new(RichText::new(&d.name).strong()).truncate());
+        ui.add(
+            egui::Label::new(RichText::new(device_kind(d)).size(11.0).color(p.text3)).truncate(),
+        );
     });
+    let mut state = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(columns[1].shrink2(Vec2::new(8.0, 0.0)))
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    widgets::status_pill(&mut state, &pill, tone);
+    if columns[2].width() > 0.0 {
+        let mut cell = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(columns[2].shrink2(Vec2::new(8.0, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        cell.add(
+            egui::Label::new(RichText::new(serial).monospace().size(11.5).color(p.text3))
+                .truncate(),
+        );
+    }
+    let mut cell = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(columns[3].shrink2(Vec2::new(8.0, 0.0)))
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    let ui = &mut cell;
+    match (&d.state, d.platform) {
+        (State::Stopped, Platform::Android) => {
+            if let Some(avd) = &d.avd {
+                let main = widgets::split_button(ui, "Start", |ui| {
+                    if widgets::menu_item(
+                        ui,
+                        "Cold boot",
+                        "Ignore the snapshot and boot from scratch",
+                        false,
+                    )
+                    .clicked()
+                    {
+                        actions.push(Action::Start(avd.clone(), Boot::Cold));
+                    }
+                    if widgets::menu_item(
+                        ui,
+                        "Wipe data and start",
+                        "Erases every app and file on this AVD",
+                        true,
+                    )
+                    .clicked()
+                    {
+                        actions.push(Action::Start(avd.clone(), Boot::Wipe));
+                    }
+                });
+                if main.clicked() {
+                    actions.push(Action::Start(avd.clone(), Boot::Normal));
+                }
+            }
+        }
+        (State::Stopped, Platform::Ios) => {
+            if let Some(udid) = &d.udid
+                && widgets::button(ui, Kind::Primary, Some(Icon::Play), "Boot").clicked()
+            {
+                actions.push(Action::IosBoot(udid.clone()));
+            }
+        }
+        (State::Running { serial }, platform) => {
+            if d.is_emulator && widgets::button(ui, Kind::Ghost, Some(Icon::Stop), "Stop").clicked()
+            {
+                actions.push(match (platform, &d.udid) {
+                    (Platform::Ios, Some(udid)) => Action::IosShutdown(udid.clone()),
+                    _ => Action::Stop(serial.clone()),
+                });
+            }
+            if widgets::button(ui, Kind::Secondary, None, "Open").clicked() {
+                actions.push(Action::Focus(serial.clone()));
+            }
+        }
+        _ => {}
+    }
 }
 
 impl eframe::App for EmuGrid {
@@ -965,63 +1368,141 @@ impl eframe::App for EmuGrid {
         let mut actions = Vec::new();
         self.visible.clear();
 
-        egui::Panel::top("top").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("emugrid");
-                ui.add_space(8.0);
-                let grid_on = self.view == View::Grid;
-                if ui.selectable_label(grid_on, "⊞ Grid").clicked() {
-                    actions.push(Action::View(View::Grid));
-                }
-                if ui.selectable_label(!grid_on, "☰ List").clicked() {
-                    actions.push(Action::View(View::List));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("⟳ Refresh").clicked() {
-                        actions.push(Action::Refresh);
+        let p = theme::palette(ctx);
+        egui::Panel::top("top")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.chrome)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .inner_margin(egui::Margin::symmetric(14, 10)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    widgets::wordmark(ui);
+                    ui.add_space(8.0);
+                    let selected = usize::from(self.view != View::Grid);
+                    let items = [(Icon::Grid, "Grid"), (Icon::List, "List")];
+                    match widgets::segmented(ui, &items, selected) {
+                        Some(0) => actions.push(Action::View(View::Grid)),
+                        Some(_) => actions.push(Action::View(View::List)),
+                        None => {}
                     }
-                    if self.scanning {
-                        ui.spinner();
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if widgets::icon_button(ui, Icon::Refresh, "Refresh devices", 32.0, true)
+                            .clicked()
+                        {
+                            actions.push(Action::Refresh);
+                        }
+                        if self.scanning {
+                            ui.spinner();
+                        }
+                    });
                 });
             });
-        });
 
-        egui::Panel::bottom("status").show(ui, |ui| {
-            let running = self.running().count();
-            ui.horizontal(|ui| {
-                ui.label(format!(
-                    "{} devices · {running} running",
-                    self.devices.len()
-                ));
-                if let Some(msg) = &self.message {
-                    ui.separator();
-                    ui.label(msg);
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.small("Drop an .apk to install it everywhere")
+        egui::Panel::bottom("status")
+            .frame(
+                egui::Frame::new()
+                    .fill(p.chrome)
+                    .stroke(Stroke::new(1.0, p.border))
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
+            )
+            .show(ui, |ui| {
+                let running = self.running().count();
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    ui.label(
+                        RichText::new(format!(
+                            "{} devices · {running} running",
+                            self.devices.len()
+                        ))
+                        .size(11.5)
+                        .color(p.text3),
+                    );
+                    if let Some(msg) = &self.message {
+                        if msg.starts_with("Error:") {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                widgets::icon(ui, Icon::Warning, 13.0, p.danger);
+                                ui.label(RichText::new(msg).size(11.5).color(p.danger));
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 5.0;
+                                let (r, _) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                ui.painter().line_segment(
+                                    [r.left_center(), r.left_bottom() - Vec2::new(-4.0, 2.0)],
+                                    Stroke::new(1.5, p.live),
+                                );
+                                ui.painter().line_segment(
+                                    [
+                                        r.left_bottom() - Vec2::new(-4.0, 2.0),
+                                        r.right_top() + Vec2::new(0.0, 2.0),
+                                    ],
+                                    Stroke::new(1.5, p.live),
+                                );
+                                ui.label(RichText::new(msg).size(11.5).color(p.text2));
+                            });
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            RichText::new("Drop an .apk to install it everywhere")
+                                .size(11.5)
+                                .color(p.text3),
+                        )
                         .on_hover_text("Installs on every running Android device");
+                    });
                 });
             });
-        });
 
-        egui::CentralPanel::default_margins().show(ui, |ui| {
-            if self.sdk.adb.is_none() && self.sdk.emulator.is_none() && !self.sdk.simctl {
-                ui.colored_label(
-                    ui.visuals().warn_fg_color,
-                    "Android SDK not found. Set ANDROID_HOME or put adb and emulator on your PATH.",
-                );
-                return;
-            }
-            match (self.view, self.focused.clone()) {
-                (View::Grid, Some(serial)) => {
-                    self.focused_view(ui, &serial, &mut actions);
-                    self.forward_keys(ctx, &serial, &mut actions);
+        egui::CentralPanel::default_margins()
+            .frame(
+                egui::Frame::new()
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ui, |ui| {
+                if self.sdk.adb.is_none() && self.sdk.emulator.is_none() && !self.sdk.simctl {
+                    ui.add_space(40.0);
+                    ui.vertical_centered(|ui| {
+                        egui::Frame::new()
+                            .fill(p.surface)
+                            .stroke(Stroke::new(1.0, p.border))
+                            .corner_radius(RADIUS_CARD)
+                            .inner_margin(24)
+                            .show(ui, |ui| {
+                                ui.vertical_centered(|ui| {
+                                    let (r, _) =
+                                        ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
+                                    ui.painter().rect_filled(r, 12, p.polled_soft);
+                                    icons::paint(
+                                        ui.painter(),
+                                        Rect::from_center_size(r.center(), Vec2::splat(22.0)),
+                                        Icon::Warning,
+                                        p.polled,
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.heading("Android SDK not found");
+                                    ui.label(
+                            RichText::new("Set ANDROID_HOME or put adb and emulator on your PATH.")
+                                .color(p.text2),
+                        );
+                                });
+                            });
+                    });
+                    return;
                 }
-                (View::Grid, None) => self.grid_view(ui, &mut actions),
-                (View::List, _) => self.list_view(ui, &mut actions),
-            }
-        });
+                match (self.view, self.focused.clone()) {
+                    (View::Grid, Some(serial)) => {
+                        self.focused_view(ui, &serial, &mut actions);
+                        self.forward_keys(ctx, &serial, &mut actions);
+                    }
+                    (View::Grid, None) => self.grid_view(ui, &mut actions),
+                    (View::List, _) => self.list_view(ui, &mut actions),
+                }
+            });
 
         // Drag-and-drop hint.
         let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
@@ -1031,12 +1512,44 @@ impl eframe::App for EmuGrid {
                 egui::Id::unique("emugrid-drop"),
             ));
             painter.rect_filled(full, 0.0, Color32::from_black_alpha(170));
-            painter.text(
+            let panel = Rect::from_center_size(
                 full.center(),
-                Align2::CENTER_CENTER,
-                "Drop .apk to install on all running Android devices",
-                FontId::proportional(18.0),
-                Color32::WHITE,
+                Vec2::new(
+                    (full.width() - 32.0).clamp(0.0, 440.0),
+                    160.0_f32.min(full.height()),
+                ),
+            );
+            painter.rect_filled(panel, 16, p.popup);
+            let c = panel.shrink(10.0);
+            let path = [
+                c.left_top(),
+                c.right_top(),
+                c.right_bottom(),
+                c.left_bottom(),
+                c.left_top(),
+            ];
+            painter.extend(egui::Shape::dashed_line(
+                &path,
+                Stroke::new(1.5, p.accent),
+                7.0,
+                5.0,
+            ));
+            icons::paint(
+                &painter,
+                Rect::from_center_size(panel.center() - Vec2::new(0.0, 26.0), Vec2::splat(32.0)),
+                Icon::Upload,
+                p.accent,
+            );
+            let text = painter.layout(
+                "Drop .apk to install on all running Android devices".to_owned(),
+                FontId::proportional(14.0),
+                p.text,
+                (panel.width() - 40.0).max(1.0),
+            );
+            painter.galley(
+                panel.center() + Vec2::new(-text.size().x / 2.0, 20.0),
+                text,
+                p.text,
             );
         }
 
@@ -1081,8 +1594,12 @@ mod tests {
         let ctx = egui::Context::default();
         let mut out = ctx.run_ui(Default::default(), |_| {});
         out.textures_delta.clear();
-        let source = include_str!("app.rs");
-        let mut chars: Vec<char> = source.chars().filter(|c| !c.is_ascii()).collect();
+        let sources = [include_str!("app.rs"), include_str!("widgets.rs")];
+        let mut chars: Vec<char> = sources
+            .iter()
+            .flat_map(|s| s.chars())
+            .filter(|c| !c.is_ascii())
+            .collect();
         chars.sort();
         chars.dedup();
         let missing: Vec<char> = ctx.fonts_mut(|f| {
@@ -1092,6 +1609,49 @@ mod tests {
                 .collect()
         });
         assert!(missing.is_empty(), "no glyph for {missing:?}");
+    }
+
+    #[test]
+    fn list_columns_hide_serial_on_narrow_windows() {
+        for width in [328.0, 600.0, 800.0] {
+            let rect = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, 58.0));
+            let cols = device_columns(rect);
+            assert_eq!(cols[2].width() > 0.0, width > 600.0);
+            assert_eq!(cols[0].left(), rect.left());
+            assert_eq!(cols[3].right(), rect.right());
+            for pair in cols.windows(2) {
+                assert_eq!(pair[0].right(), pair[1].left());
+            }
+        }
+    }
+
+    #[test]
+    fn focused_device_without_frame_still_draws_a_bezel() {
+        let ctx = egui::Context::default();
+        let mut app = EmuGrid::new(&ctx);
+        app.devices = vec![Device {
+            name: "phone".into(),
+            platform: Platform::Android,
+            is_emulator: true,
+            state: State::Running {
+                serial: "emulator-5554".into(),
+            },
+            avd: None,
+            runtime: None,
+            udid: None,
+        }];
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0))),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| {
+            app.focused_view(ui, "emulator-5554", &mut Vec::new());
+        });
+        out.textures_delta.clear();
+        assert!(out.shapes.iter().any(|shape| matches!(
+            &shape.shape,
+            egui::Shape::Rect(rect) if rect.fill == crate::theme::BEZEL
+        )));
     }
 
     /// Clicking the middle of the focused screen sends a tap there.

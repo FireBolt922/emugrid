@@ -4,9 +4,12 @@ mod app;
 mod capture;
 mod devices;
 mod grid;
+mod icons;
 mod input;
 mod ios;
 mod sdk;
+mod theme;
+mod widgets;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -19,6 +22,9 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "emugrid",
         options,
-        Box::new(|cc| Ok(Box::new(app::EmuGrid::new(&cc.egui_ctx)))),
+        Box::new(|cc| {
+            theme::install(&cc.egui_ctx);
+            Ok(Box::new(app::EmuGrid::new(&cc.egui_ctx)))
+        }),
     )
 }
