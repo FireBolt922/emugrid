@@ -217,11 +217,15 @@ async fn stream_async(
         {
             last_sent = Some(Instant::now());
             control.live.store(true, Ordering::Relaxed);
-            send(Frame {
+            let frame = Frame {
                 width: img.width,
                 height: img.height,
                 rgb: img.pixels,
-            });
+            };
+            if size == super::NATIVE_SIZE {
+                control.record_size(&frame);
+            }
+            send(frame);
         }
     }
 }
