@@ -1,0 +1,67 @@
+name: Pages
+
+# Builds the download page (site/) from every published GitHub release and
+# deploys it to GitHub Pages. The Release workflow calls it after each
+# release. Run it by hand (Actions → Pages → Run workflow) after changing
+# site/ or after editing a release on GitHub (for example, turning a
+# pre-release into a full release).
+#
+# Needs once: Settings → Pages → Build and deployment → Source "GitHub Actions".
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# One deployment at a time; a queued run waits instead of cancelling one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build the download page
+    runs-on: ubuntu-latest
+    steps:
+      # Always the site from main, even when called from a release run.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test the page renderer
+        run: node --test site/*.test.mjs
+
+      # Drafts are left out by the renderer.
+      - name: Build the page
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node site/build.mjs --repo "$GITHUB_REPOSITORY" --out _site
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Summary
+        env:
+          URL: ${{ steps.deployment.outputs.page_url }}
+        run: |
+          echo "Download page: ${URL}" >> "$GITHUB_STEP_SUMMARY"

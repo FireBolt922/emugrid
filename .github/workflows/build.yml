@@ -1,21 +1,29 @@
 name: Build
 
-# Manual only: run from the Actions tab ("Run workflow").
-# Produces downloadable binaries for macOS (Apple Silicon + Intel), Windows and Linux.
-# Fill in "release_tag" to also publish them as a GitHub release.
+# Builds the downloads for macOS, Windows and Linux and uploads them as
+# workflow artifacts. Run it by hand from the Actions tab for a test build,
+# or let the Release workflow call it (that is how releases are built).
+#
+#   macOS    emugrid-<version>-macos-universal.dmg  (Apple silicon + Intel)
+#   Windows  emugrid-<version>-windows-x86_64.zip
+#   Linux    emugrid-<version>-linux-x86_64.tar.gz
+#
+# Builds are unsigned. The macOS app gets an ad-hoc signature so Gatekeeper
+# offers "Open Anyway" instead of calling it damaged.
 on:
   workflow_dispatch:
+  workflow_call:
     inputs:
-      release_tag:
-        description: "Optional: publish a GitHub release with this tag (e.g. v0.2.0). Empty = artifacts only."
-        required: false
+      ref:
+        description: Commit to build (defaults to the triggering commit).
+        type: string
         default: ""
 
 permissions:
   contents: read
 
 env:
-  # Lightweight is the point of emugrid: fail if the binary grows past this.
+  # Lightweight is the point of emugrid: fail if a binary grows past this.
   MAX_BINARY_BYTES: 8388608
 
 jobs:
@@ -25,61 +33,75 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: macos-arm64, os: macos-latest, target: aarch64-apple-darwin, exe: emugrid }
-          - { name: macos-x86_64, os: macos-latest, target: x86_64-apple-darwin, exe: emugrid }
-          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc, exe: emugrid.exe }
-          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64-unknown-linux-gnu, exe: emugrid }
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-latest
+            targets: x86_64-pc-windows-msvc
+          - name: linux-x86_64
+            os: ubuntu-22.04 # older glibc, so the binary runs on more distros
+            targets: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ matrix.targets }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.name }}
       - name: Linux GUI deps
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libwayland-dev
 
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          for target in $(echo '${{ matrix.targets }}' | tr ',' ' '); do
+            cargo build --release --locked --target "$target"
+          done
 
       - name: Size budget
         run: |
-          bin="target/${{ matrix.target }}/release/${{ matrix.exe }}"
-          size=$(wc -c < "$bin" | tr -d ' ')
-          echo "### ${{ matrix.name }}: $((size / 1024)) KiB" >> "$GITHUB_STEP_SUMMARY"
-          if [ "$size" -gt "$MAX_BINARY_BYTES" ]; then
-            echo "::error::Binary is $size bytes, over the $MAX_BINARY_BYTES byte budget"
-            exit 1
-          fi
+          for target in $(echo '${{ matrix.targets }}' | tr ',' ' '); do
+            bin="target/$target/release/emugrid"
+            [ -f "$bin" ] || bin="$bin.exe"
+            size=$(wc -c < "$bin" | tr -d ' ')
+            echo "### $target: $((size / 1024)) KiB" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$size" -gt "$MAX_BINARY_BYTES" ]; then
+              echo "::error::$target binary is $size bytes, over the $MAX_BINARY_BYTES byte budget"
+              exit 1
+            fi
+          done
 
       - name: Package
         run: |
-          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          bin="target/${{ matrix.target }}/release/${{ matrix.exe }}"
-          name="emugrid-${{ matrix.name }}"
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          name="emugrid-${version}-${{ matrix.name }}"
           mkdir -p dist
           case "${{ runner.os }}" in
             macOS)
-              app="dist/emugrid.app/Contents"
+              app="stage/emugrid.app/Contents"
               mkdir -p "$app/MacOS"
-              cp "$bin" "$app/MacOS/emugrid"
+              lipo -create -output "$app/MacOS/emugrid" \
+                target/aarch64-apple-darwin/release/emugrid \
+                target/x86_64-apple-darwin/release/emugrid
               sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
-              # Ad-hoc signature so Gatekeeper treats it as unidentified, not "damaged".
-              codesign --force --deep --sign - dist/emugrid.app
-              (cd dist && ditto -c -k --keepParent emugrid.app "$name.zip" && rm -rf emugrid.app)
+              codesign --force --deep --sign - stage/emugrid.app
+              ln -s /Applications stage/Applications
+              hdiutil create -volname emugrid -srcfolder stage -ov -format UDZO "dist/$name.dmg"
               ;;
             Windows)
-              cp "$bin" dist/
+              cp target/x86_64-pc-windows-msvc/release/emugrid.exe dist/
               (cd dist && 7z a -tzip "$name.zip" emugrid.exe >/dev/null && rm emugrid.exe)
               ;;
             Linux)
-              cp "$bin" dist/
+              cp target/x86_64-unknown-linux-gnu/release/emugrid dist/
               (cd dist && tar czf "$name.tar.gz" emugrid && rm emugrid)
               ;;
           esac
@@ -90,25 +112,4 @@ jobs:
           name: emugrid-${{ matrix.name }}
           path: dist/*
           if-no-files-found: error
-
-  release:
-    if: inputs.release_tag != ''
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
-        run: |
-          gh release create "$TAG" dist/* \
-            --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title "emugrid $TAG" \
-            --generate-notes
+          retention-days: 14

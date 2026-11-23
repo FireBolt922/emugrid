@@ -1,0 +1,249 @@
+name: Release
+
+# One click releases everything: Actions → Release → Run workflow (on main).
+#
+#   1. prepare  picks the version and commits the bump to a temporary branch
+#   2. checks   fmt, clippy and tests on macOS, Windows and Linux   (ci.yml)
+#   3. build    macOS .dmg, Windows .zip, Linux .tar.gz             (build.yml)
+#   4. publish  moves main to the bump commit, tags it, and creates the
+#               GitHub release with the downloads and SHA256SUMS.txt
+#   5. pages    rebuilds the download page with every release        (pages.yml)
+#
+# Nothing touches main or creates a tag until checks and builds pass. If a
+# step fails, the temporary branch is deleted and nothing is released.
+#
+# Needs once: Settings → Pages → Build and deployment → Source "GitHub Actions".
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: >-
+          auto: release the version in Cargo.toml if it has no tag yet,
+          otherwise raise PATCH. Or pick the part to raise.
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      version:
+        description: "Optional exact version (e.g. 1.0.0). Overrides bump."
+        type: string
+        default: ""
+      channel:
+        description: >-
+          release: public release. prerelease: marked "Pre-release" (test build).
+          draft: only you can see it, and the download page is not updated.
+        type: choice
+        options: [release, prerelease, draft]
+        default: release
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: choose version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the temporary release branch
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      bumped: ${{ steps.version.outputs.bumped }}
+      branch: ${{ steps.version.outputs.branch }}
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run from main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "Run the Release workflow from main, not ${GITHUB_REF}." >&2
+          exit 1
+
+      - name: Choose the version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+        run: |
+          current=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          tagged() { git ls-remote --exit-code --tags origin "refs/tags/v$1" >/dev/null; }
+          IFS=. read -r major minor patch <<< "$current"
+          if [ -n "$EXACT" ]; then
+            next=${EXACT#v}
+          else
+            case "$BUMP" in
+              auto) if tagged "$current"; then next="$major.$minor.$((patch + 1))"; else next=$current; fi ;;
+              patch) next="$major.$minor.$((patch + 1))" ;;
+              minor) next="$major.$((minor + 1)).0" ;;
+              major) next="$((major + 1)).0.0" ;;
+            esac
+          fi
+          if ! printf '%s' "$next" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Version '$next' is not MAJOR.MINOR.PATCH." >&2
+            exit 1
+          fi
+          if tagged "$next"; then
+            echo "v$next is already released. Pick a higher version." >&2
+            exit 1
+          fi
+          bumped=false
+          [ "$next" != "$current" ] && bumped=true
+          {
+            echo "version=$next"
+            echo "bumped=$bumped"
+            echo "branch=release/v$next"
+          } >> "$GITHUB_OUTPUT"
+          echo "### Releasing v$next (Cargo.toml was $current)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit the version bump
+        id: commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUMPED: ${{ steps.version.outputs.bumped }}
+          BRANCH: ${{ steps.version.outputs.branch }}
+        run: |
+          if [ "$BUMPED" != true ]; then
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          sed -i "0,/^version = \".*\"$/s//version = \"$VERSION\"/" Cargo.toml
+          awk -v v="$VERSION" '
+            prev == "name = \"emugrid\"" && /^version = / { $0 = "version = \"" v "\"" }
+            { print; prev = $0 }
+          ' Cargo.lock > Cargo.lock.new && mv Cargo.lock.new Cargo.lock
+          git diff --stat
+          grep -q "^version = \"$VERSION\"$" Cargo.toml
+          test "$(git diff --numstat | wc -l)" -eq 2
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git commit -am "chore(release): v$VERSION"
+          git push origin "$BRANCH"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.prepare.outputs.sha }}
+
+  publish:
+    name: publish v${{ needs.prepare.outputs.version }}
+    needs: [prepare, checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # move main, create the tag and the release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: emugrid-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # Fast-forward only: refused if someone pushed to main during the run.
+      - name: Move main to the release commit
+        if: needs.prepare.outputs.bumped == 'true'
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          if ! git push origin "$SHA:refs/heads/main"; then
+            echo "main moved while the release was building. Run Release again." >&2
+            exit 1
+          fi
+
+      - name: Release notes
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          owner=$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          page="https://${owner}.github.io/${GITHUB_REPOSITORY#*/}/"
+          {
+            if [ "$CHANNEL" = prerelease ]; then
+              echo "> **Test build.** Not for general use yet."
+              echo
+            fi
+            echo "Download page: ${page}"
+            echo
+            echo "| System | File |"
+            echo "| --- | --- |"
+            echo "| macOS 11 or later (Apple silicon and Intel) | \`emugrid-${VERSION}-macos-universal.dmg\` |"
+            echo "| Windows 10/11, 64-bit | \`emugrid-${VERSION}-windows-x86_64.zip\` |"
+            echo "| Linux x86_64 (glibc 2.35+) | \`emugrid-${VERSION}-linux-x86_64.tar.gz\` |"
+            echo
+            echo "Builds are not signed: macOS and Windows warn the first time you open them."
+            echo "Check a download against \`SHA256SUMS.txt\`."
+            echo
+          } > notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          flags=()
+          case "$CHANNEL" in
+            prerelease) flags=(--prerelease) ;;
+            draft) flags=(--draft) ;;
+            release) flags=(--latest) ;;
+          esac
+          gh release create "v${VERSION}" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "emugrid ${VERSION}" \
+            --notes-file notes.md \
+            --generate-notes \
+            "${flags[@]}"
+          echo "Released v${VERSION} (${CHANNEL})" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Delete the temporary branch
+        if: needs.prepare.outputs.bumped == 'true'
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: git push origin --delete "$BRANCH" || echo "Could not delete $BRANCH; delete it by hand."
+
+  pages:
+    needs: publish
+    if: inputs.channel != 'draft'
+    uses: ./.github/workflows/pages.yml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+  # Leaves nothing behind when checks or builds fail.
+  cleanup:
+    name: clean up after a failed release
+    needs: [prepare, checks, build, publish]
+    if: failure() && needs.prepare.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Delete the temporary branch
+        env:
+          BRANCH: ${{ needs.prepare.outputs.branch }}
+        run: git push origin --delete "$BRANCH" || true

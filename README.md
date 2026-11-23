@@ -68,13 +68,20 @@ Use **Cmd** on macOS and **Ctrl** on Linux and Windows to trigger these shortcut
 
 ## Download
 
-Builds are produced by the manual **Build** workflow (Actions tab → *Build* → *Run workflow*):
-macOS (Apple Silicon and Intel, as `emugrid.app`), Windows (`emugrid.exe`) and Linux.
-Give it a `release_tag` to publish a GitHub release too.
+Get the latest build for macOS, Windows or Linux from the
+**[download page](https://firebolt922.github.io/emugrid/)**. It also lists every earlier release.
+Downloads are also on [GitHub Releases](https://github.com/FireBolt922/emugrid/releases).
 
-> The macOS app is not notarized. The first time you open it, macOS blocks it:
-> go to **System Settings → Privacy & Security** and click **Open Anyway**
-> (or run `xattr -dr com.apple.quarantine emugrid.app`).
+| System | File |
+|---|---|
+| macOS 11+ (Apple silicon and Intel) | `emugrid-<version>-macos-universal.dmg` |
+| Windows 10/11, 64-bit | `emugrid-<version>-windows-x86_64.zip` |
+| Linux x86_64 | `emugrid-<version>-linux-x86_64.tar.gz` |
+
+> Builds are not signed. On macOS, the first time you open the app, go to
+> **System Settings → Privacy & Security** and click **Open Anyway**
+> (or run `xattr -dr com.apple.quarantine /Applications/emugrid.app`).
+> On Windows, click **More info → Run anyway** in SmartScreen.
 
 ## Build & run
 
@@ -112,13 +119,24 @@ no codegen and no `protoc` needed to build. More detail is in [docs/IDEA.md](doc
 | CPU | ~3.5% of one core |
 | Memory | ~103 MB RSS |
 
-## CI
+## CI and releases
 
-All workflows are **manual** (`workflow_dispatch`), nothing runs on push:
+All workflows are **manual** (`workflow_dispatch`). Nothing runs on push.
 
+- **Release:** the single button for shipping a new version (Actions → *Release* → *Run workflow* on `main`).
+  It picks the version, runs Checks, builds every platform, then moves `main` to the version-bump commit,
+  tags it, publishes the GitHub release with `SHA256SUMS.txt`, and redeploys the download page.
+  If anything fails, nothing is released and `main` is left untouched.
+  - `bump`: `auto` releases the version in `Cargo.toml` if it has no tag yet, otherwise raises PATCH.
+    Pick `patch` / `minor` / `major` to choose, or type an exact `version`.
+  - `channel`: `release`, `prerelease` (marked as a test build), or `draft` (hidden, page not updated).
 - **Checks:** `cargo fmt`, `clippy -D warnings`, `cargo test` on macOS, Windows, Linux
-- **Build:** release binaries for all platforms, fails if any is over the 8 MB budget,
-  optional GitHub release
+- **Build:** test builds for all platforms as workflow artifacts. Fails if a binary is over the 8 MB budget.
+- **Pages:** rebuilds the [download page](https://firebolt922.github.io/emugrid/) (`site/`) from every
+  published release. Run it after editing `site/` or a release on GitHub.
+
+Preview the page locally with `node site/build.mjs --repo FireBolt922/emugrid --out _site`, then open
+`_site/index.html` through any static server. Run its tests with `node --test site/*.test.mjs`.
 
 ## License
 

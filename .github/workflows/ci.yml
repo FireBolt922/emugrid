@@ -1,8 +1,18 @@
 name: Checks
 
-# Manual only: run from the Actions tab ("Run workflow").
+# Manual only: run from the Actions tab ("Run workflow"). The Release
+# workflow also runs these checks on the commit it is about to release.
 on:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to check (defaults to the triggering commit).
+        type: string
+        default: ""
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -13,6 +23,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
