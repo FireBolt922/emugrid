@@ -4,8 +4,9 @@
 //! the release reach Android as real touch events with no per-event process
 //! start (the old `input tap` path costs ~60-100 ms per event).
 
-use crate::sdk::{self, Sdk};
+use crate::sdk;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -158,8 +159,7 @@ pub struct Finger {
 impl Finger {
     /// Create the touchscreen. Blocks for up to a few seconds; call it off
     /// the UI thread. Fails on devices without `uinput` access.
-    pub fn start(sdk: &Sdk, serial: &str) -> Result<Finger, String> {
-        let adb = sdk.adb.as_ref().ok_or("adb not found")?;
+    pub fn start(adb: &Path, serial: &str) -> Result<Finger, String> {
         let mut child = sdk::command(adb)
             .args(["-s", serial, "shell", "uinput", "-"])
             .stdin(Stdio::piped())
@@ -181,7 +181,7 @@ impl Finger {
         let alive = Arc::new(AtomicBool::new(true));
         // The display can rotate at any time; keep the rotation fresh.
         let (adb, serial, rot, live) = (
-            adb.clone(),
+            adb.to_path_buf(),
             serial.to_string(),
             rotation.clone(),
             alive.clone(),
@@ -240,7 +240,7 @@ impl Drop for Finger {
 }
 
 /// Wait until Android lists the new touchscreen.
-fn wait_for_device(adb: &std::path::Path, serial: &str, child: &mut Child) -> bool {
+fn wait_for_device(adb: &Path, serial: &str, child: &mut Child) -> bool {
     let begun = Instant::now();
     while begun.elapsed() < Duration::from_secs(4) {
         thread::sleep(Duration::from_millis(250));
@@ -258,7 +258,7 @@ fn wait_for_device(adb: &std::path::Path, serial: &str, child: &mut Child) -> bo
     false
 }
 
-fn read_rotation(adb: &std::path::Path, serial: &str) -> Option<u8> {
+fn read_rotation(adb: &Path, serial: &str) -> Option<u8> {
     let out = sdk::command(adb)
         .args(["-s", serial, "shell", "dumpsys window displays"])
         .output()
@@ -319,6 +319,44 @@ mod tests {
         );
     }
 
+    /// Each step is one `inject` line; a closed pipe reports the finger gone.
+    #[test]
+    fn finger_writes_one_line_per_step() {
+        use std::sync::Mutex;
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let mut f = Finger::to_writer(sink.clone());
+        assert!(f.send(Touch::Down(0.5, 0.5)));
+        assert!(f.send(Touch::Up));
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], inject_json(Touch::Up, 0));
+
+        struct Closed;
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut gone = Finger::to_writer(Closed);
+        assert!(!gone.send(Touch::Up));
+        assert!(!gone.send(Touch::Up), "stays gone");
+    }
+
     #[test]
     fn register_describes_a_direct_touchscreen() {
         let r = register_json();
@@ -332,7 +370,8 @@ mod tests {
     #[ignore]
     fn live_finger_registers() {
         let serial = std::env::var("EMUGRID_SERIAL").unwrap_or("emulator-5554".into());
-        let mut f = Finger::start(&Sdk::detect(), &serial).expect("touchscreen");
+        let adb = sdk::Sdk::detect(None).adb.expect("adb");
+        let mut f = Finger::start(&adb, &serial).expect("touchscreen");
         // Swipe up from the lower middle, like a finger (opens the app
         // drawer on a home screen).
         assert!(f.send(Touch::Down(0.5, 0.8)));
