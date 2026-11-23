@@ -475,12 +475,29 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn persistent_shell_preserves_order_and_acknowledges_each_result() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // A fake `input` on PATH stands in for Android's, and `sh -s` reads
+        // commands line by line from stdin, as `adb shell sh -s` does.
+        // (Sourcing /dev/stdin instead stops after the first read on macOS,
+        // whose /bin/sh is bash 3.2.)
+        let bin = std::env::temp_dir().join(format!("emugrid-shell-test-{}", std::process::id()));
+        std::fs::create_dir_all(&bin).unwrap();
+        let input = bin.join("input");
+        std::fs::write(
+            &input,
+            "#!/bin/sh\nprintf ' motionevent <DOWN|UP|MOVE|CANCEL>\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&input, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
         let mut process = Process::new("sh");
-        // Stand in for Android's input help in the test shell.
-        process.args([
-            "-c",
-            "input() { printf ' motionevent <DOWN|UP|MOVE|CANCEL>\\n'; }; . /dev/stdin",
-        ]);
+        process.arg("-s").env("PATH", path);
         let shell = Shell::open(process).unwrap();
         assert!(shell.live_touch && shell.cancel_touch);
         assert!(shell.run("value=first").unwrap());
