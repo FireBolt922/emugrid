@@ -23,7 +23,11 @@
 ## v0.4: Quality of life
 - [x] Cold boot / wipe data (shipped in v0.2)
 - [x] Install an APK on all running devices at once (drag and drop; shipped in v0.2)
-- [ ] Remember window layout
+- [x] Redesigned Grid, Focused, List, and Setup views with a device sidebar
+- [x] Persist the SDK folder, grid tile size, and sidebar visibility
+- [x] Focused device shortcuts, inspector, and native-pixel zoom
+- [x] Per-device APK install progress and retry, plus confirmation before wiping
+- [ ] Remember window size and position
 - [x] iOS simulators (macOS: list, boot, shut down, view-only screen; shipped in v0.2)
 
 ## Release

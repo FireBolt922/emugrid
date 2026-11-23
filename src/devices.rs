@@ -1,7 +1,7 @@
 //! Discovering emulators and devices, and starting / stopping them.
 
-use crate::ios;
 use crate::sdk::{Sdk, command};
+use crate::{avd, ios};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -17,22 +17,29 @@ pub enum State {
     /// Created in the SDK but not running.
     Stopped,
     /// Running and reachable (adb serial like `emulator-5554`, or an iOS UDID).
-    Running { serial: String },
-    /// Seen by adb but not ready yet (booting, offline, unauthorized...).
-    Other { serial: String, status: String },
+    Running {
+        serial: String,
+    },
+    Booting {
+        serial: Option<String>,
+    },
+    /// Seen by adb but offline, unauthorized, or otherwise unavailable.
+    Other {
+        serial: String,
+        status: String,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct Device {
-    /// AVD name for emulators, model/serial for physical devices.
-    pub name: String,
+    pub display_name: String,
+    pub api: Option<u32>,
+    pub os: Option<String>,
     pub platform: Platform,
     pub is_emulator: bool,
     pub state: State,
     /// AVD name, if this is one of the SDK's AVDs (enables start / cold boot / wipe).
     pub avd: Option<String>,
-    /// iOS: runtime ("iOS 18.2") and UDID.
-    pub runtime: Option<String>,
     pub udid: Option<String>,
 }
 
@@ -43,16 +50,31 @@ impl Device {
             _ => None,
         }
     }
+    pub fn known_serial(&self) -> Option<&str> {
+        match &self.state {
+            State::Booting { serial } => serial.as_deref(),
+            State::Other { serial, .. } => Some(serial),
+            _ => self.serial(),
+        }
+    }
+
+    pub fn title(&self) -> String {
+        match self.api {
+            Some(api) => format!("{} · API {api}", self.display_name),
+            None => self.display_name.clone(),
+        }
+    }
 }
 
 fn android(name: String, is_emulator: bool, state: State, avd: Option<String>) -> Device {
     Device {
-        name,
+        display_name: name,
+        api: None,
+        os: None,
         platform: Platform::Android,
         is_emulator,
         state,
         avd,
-        runtime: None,
         udid: None,
     }
 }
@@ -61,61 +83,94 @@ fn android(name: String, is_emulator: bool, state: State, avd: Option<String>) -
 pub fn scan(sdk: &Sdk) -> Vec<Device> {
     let mut by_name: BTreeMap<String, Device> = BTreeMap::new();
 
-    for avd in list_avds(sdk) {
-        by_name.insert(
-            avd.clone(),
-            android(avd.clone(), true, State::Stopped, Some(avd)),
+    let avd_home = avd::home();
+    for name in list_avds(sdk) {
+        let metadata = avd_home
+            .as_deref()
+            .map_or_else(avd::Metadata::default, |home| avd::read(home, &name));
+        let mut device = android(
+            metadata.display_name.unwrap_or_else(|| name.clone()),
+            true,
+            State::Stopped,
+            Some(name.clone()),
         );
+        device.api = metadata.api;
+        device.os = metadata.os;
+        by_name.insert(name, device);
     }
 
     for (serial, status) in adb_devices(sdk) {
         let ready = status == "device";
-        // Emulators started by the SDK use `emulator-NNNN`; ones started by other
-        // tools (e.g. Orca) connect over TCP, so ask the device itself.
-        let (model, qemu) = if ready {
+        let props = if ready {
             props(sdk, &serial)
         } else {
-            (None, false)
+            Props::default()
         };
-        let is_emulator = serial.starts_with("emulator-") || qemu;
-        let avd = (ready && serial.starts_with("emulator-"))
-            .then(|| avd_name(sdk, &serial))
-            .flatten();
-        let state = if ready {
-            State::Running {
-                serial: serial.clone(),
-            }
-        } else {
+        let sdk_emulator = serial.starts_with("emulator-");
+        let avd = sdk_emulator.then(|| avd_name(sdk, &serial)).flatten();
+        let state = if !ready {
             State::Other {
                 serial: serial.clone(),
                 status,
             }
+        } else if props.booted {
+            State::Running {
+                serial: serial.clone(),
+            }
+        } else {
+            State::Booting {
+                serial: Some(serial.clone()),
+            }
         };
-        match avd {
-            // Known AVD: replace its "stopped" entry.
-            Some(name) => {
-                by_name.insert(
-                    name.clone(),
-                    android(name.clone(), is_emulator, state, Some(name)),
-                );
-            }
-            // Anything else: keyed by serial so identical models don't collide.
-            None => {
-                let name = model.unwrap_or_else(|| serial.clone());
-                by_name.insert(
-                    format!("~{serial}"),
-                    android(name, is_emulator, state, None),
-                );
-            }
+        let key = avd.clone().unwrap_or_else(|| format!("~{serial}"));
+        let mut device = by_name.remove(&key).unwrap_or_else(|| {
+            let name = props
+                .model
+                .clone()
+                .or_else(|| avd.clone())
+                .unwrap_or(serial);
+            android(name, sdk_emulator || props.qemu, State::Stopped, avd)
+        });
+        if device.avd.as_deref() == Some(device.display_name.as_str())
+            && let Some(model) = props.model
+        {
+            device.display_name = model;
         }
+        device.state = state;
+        device.api = props.api.or(device.api);
+        if !device
+            .os
+            .as_deref()
+            .is_some_and(|os| os.starts_with("Wear OS"))
+        {
+            device.os = props
+                .release
+                .map(|v| format!("Android {v}"))
+                .or_else(|| {
+                    device
+                        .api
+                        .and_then(crate::avd::android_version)
+                        .map(|v| format!("Android {v}"))
+                })
+                .or(device.os);
+        }
+        by_name.insert(key, device);
     }
 
     let mut list: Vec<Device> = by_name.into_values().collect();
     if sdk.simctl {
         list.extend(ios_simulators());
     }
-    // Running first, then alphabetical.
-    list.sort_by_key(|d| (matches!(d.state, State::Stopped), d.name.to_lowercase()));
+    // Sort by readiness, then name.
+    list.sort_by_key(|d| {
+        let order = match d.state {
+            State::Running { .. } => 0,
+            State::Booting { .. } => 1,
+            State::Other { .. } => 2,
+            State::Stopped => 3,
+        };
+        (order, d.display_name.to_lowercase())
+    });
     list
 }
 
@@ -163,27 +218,44 @@ fn avd_name(sdk: &Sdk, serial: &str) -> Option<String> {
     out.lines()
         .next()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && !s.starts_with("KO:") && *s != "OK")
 }
 
-/// Model name and whether the device is an emulator (QEMU), in one adb call.
-fn props(sdk: &Sdk, serial: &str) -> (Option<String>, bool) {
-    let Some(adb) = &sdk.adb else {
-        return (None, false);
-    };
-    let out = run(
-        adb,
-        &[
-            "-s",
-            serial,
-            "shell",
-            "getprop ro.product.model; getprop ro.kernel.qemu",
-        ],
-    )
-    .unwrap_or_default();
-    let mut lines = out.lines().map(str::trim);
+#[derive(Default)]
+struct Props {
+    model: Option<String>,
+    qemu: bool,
+    release: Option<String>,
+    api: Option<u32>,
+    booted: bool,
+}
+
+fn parse_props(out: &str) -> Props {
+    let mut lines = out.split('\n').map(str::trim);
     let model = lines.next().filter(|s| !s.is_empty()).map(String::from);
-    (model, lines.next() == Some("1"))
+    let qemu = lines.next() == Some("1");
+    let release = lines.next().filter(|s| !s.is_empty()).map(String::from);
+    let api = lines.next().and_then(|s| s.parse().ok());
+    let booted = lines.next() == Some("1");
+    Props {
+        model,
+        qemu,
+        release,
+        api,
+        booted,
+    }
+}
+
+/// Get model, system and boot state in one adb call.
+fn props(sdk: &Sdk, serial: &str) -> Props {
+    const COMMAND: &str = concat!(
+        "getprop ro.product.model; getprop ro.kernel.qemu; ",
+        "getprop ro.build.version.release; getprop ro.build.version.sdk; getprop sys.boot_completed"
+    );
+    sdk.adb
+        .as_ref()
+        .and_then(|adb| run(adb, &["-s", serial, "shell", COMMAND]))
+        .map_or_else(Props::default, |out| parse_props(&out))
 }
 
 fn ios_simulators() -> Vec<Device> {
@@ -193,7 +265,9 @@ fn ios_simulators() -> Vec<Device> {
         // Watch / TV / Vision simulators have no phone-like screen worth gridding.
         .filter(|s| s.runtime.starts_with("iOS"))
         .map(|s| Device {
-            name: s.name,
+            display_name: s.name,
+            api: None,
+            os: Some(s.runtime),
             platform: Platform::Ios,
             is_emulator: true,
             state: if s.booted {
@@ -204,7 +278,6 @@ fn ios_simulators() -> Vec<Device> {
                 State::Stopped
             },
             avd: None,
-            runtime: Some(s.runtime),
             udid: Some(s.udid),
         })
         .collect()
@@ -221,7 +294,7 @@ pub enum Boot {
 }
 
 /// Launch an AVD in the background; the emulator outlives this app.
-pub fn start(sdk: &Sdk, avd: &str, boot: Boot) -> Result<(), String> {
+pub fn start(sdk: &Sdk, avd: &str, boot: Boot) -> Result<std::process::Child, String> {
     let emu = sdk.emulator.as_ref().ok_or("emulator binary not found")?;
     let mut cmd = command(emu);
     cmd.args(["-avd", avd]);
@@ -237,18 +310,33 @@ pub fn start(sdk: &Sdk, avd: &str, boot: Boot) -> Result<(), String> {
     cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
 /// Shut down a running emulator.
 pub fn stop(sdk: &Sdk, serial: &str) -> Result<(), String> {
+    emulator_command(sdk, serial, "kill")
+}
+
+fn emulator_command(sdk: &Sdk, serial: &str, action: &str) -> Result<(), String> {
     let adb = sdk.adb.as_ref().ok_or("adb not found")?;
-    command(adb)
-        .args(["-s", serial, "emu", "kill"])
+    let output = command(adb)
+        .args(["-s", serial, "emu", action])
         .output()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rejection = stdout.lines().find(|line| line.starts_with("KO:"));
+    if output.status.success() && rejection.is_none() {
+        return Ok(());
+    }
+    let detail = rejection
+        .or_else(|| stderr.lines().find(|line| !line.trim().is_empty()))
+        .or_else(|| stdout.lines().find(|line| !line.trim().is_empty()));
+    Err(format!(
+        "Could not {action} {serial}: {}",
+        detail.unwrap_or("adb command failed")
+    ))
 }
 
 pub fn ios_boot(udid: &str) -> Result<(), String> {
@@ -281,25 +369,61 @@ fn simctl(args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// `adb install -r` an APK on one device.
-pub fn install(sdk: &Sdk, serial: &str, apk: &Path) -> Result<(), String> {
-    let adb = sdk.adb.as_ref().ok_or("adb not found")?;
-    let out = command(adb)
-        .args(["-s", serial, "install", "-r"])
+#[derive(Debug)]
+pub struct InstallFailure {
+    pub code: Option<String>,
+    pub detail: String,
+}
+
+impl InstallFailure {
+    pub fn allows_downgrade(&self) -> bool {
+        self.code.as_deref() == Some("INSTALL_FAILED_VERSION_DOWNGRADE")
+    }
+}
+
+fn install_failure(detail: String) -> InstallFailure {
+    // adb prints the APK path before the failure. Only accept a status code
+    // from the failure itself, so a filename cannot trigger the downgrade retry.
+    let code = detail.lines().find_map(|line| {
+        let text = line
+            .split_once("Failure [")
+            .map_or(line.trim(), |(_, error)| error);
+        let code = text
+            .split(|ch: char| !ch.is_ascii_uppercase() && ch != '_' && !ch.is_ascii_digit())
+            .next()?;
+        (code.starts_with("INSTALL_FAILED_") && code.len() > "INSTALL_FAILED_".len())
+            .then(|| code.to_owned())
+    });
+    InstallFailure { code, detail }
+}
+
+/// Install or replace an APK on one device.
+pub fn install(sdk: &Sdk, serial: &str, apk: &Path, downgrade: bool) -> Result<(), InstallFailure> {
+    let adb = sdk
+        .adb
+        .as_ref()
+        .ok_or_else(|| install_failure("adb not found".into()))?;
+    let mut cmd = command(adb);
+    cmd.args(["-s", serial, "install", "-r"]);
+    if downgrade {
+        cmd.arg("-d");
+    }
+    let out = cmd
         .arg(apk)
         .output()
-        .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if out.status.success() && text.contains("Success") {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let line = err
-            .lines()
-            .chain(text.lines())
-            .find(|l| !l.trim().is_empty());
-        Err(line.unwrap_or("install failed").trim().to_string())
+        .map_err(|err| install_failure(err.to_string()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() && stdout.lines().any(|line| line.trim() == "Success") {
+        return Ok(());
     }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let detail = format!("{}\n{}", stderr.trim(), stdout.trim());
+    let detail = detail.trim();
+    Err(install_failure(if detail.is_empty() {
+        format!("adb install exited with {}", out.status)
+    } else {
+        detail.into()
+    }))
 }
 
 /// Run `adb -s <serial> shell <cmd>`; returns stdout.
@@ -314,12 +438,7 @@ pub fn shell(sdk: &Sdk, serial: &str, cmd: &str) -> Result<String, String> {
 
 /// Rotate an emulator's screen 90°.
 pub fn rotate(sdk: &Sdk, serial: &str) -> Result<(), String> {
-    let adb = sdk.adb.as_ref().ok_or("adb not found")?;
-    command(adb)
-        .args(["-s", serial, "emu", "rotate"])
-        .output()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    emulator_command(sdk, serial, "rotate")
 }
 
 /// Save a full-resolution screenshot to the Desktop (or home). Returns the path.
@@ -338,7 +457,7 @@ pub fn save_screenshot(sdk: &Sdk, device: &Device) -> Result<std::path::PathBuf,
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let safe: String = device
-        .name
+        .display_name
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
@@ -367,11 +486,45 @@ pub fn save_screenshot(sdk: &Sdk, device: &Device) -> Result<std::path::PathBuf,
 mod tests {
     use super::*;
 
+    #[test]
+    fn parses_boot_props_with_empty_fields_and_crlf() {
+        let props = parse_props("Pixel 8\r\n\r\n15\r\n35\r\n1\r\n");
+        assert_eq!(props.model.as_deref(), Some("Pixel 8"));
+        assert!(!props.qemu);
+        assert_eq!(props.release.as_deref(), Some("15"));
+        assert_eq!(props.api, Some(35));
+        assert!(props.booted);
+        assert!(!parse_props("Pixel\n1\n15\n35\n\n").booted);
+    }
+
+    #[test]
+    fn extracts_install_failure_code_from_multiline_output() {
+        let failure = install_failure("Performing Streamed Install\nadb: failed to install app-debug.apk: Failure [INSTALL_FAILED_VERSION_DOWNGRADE: version 5 is older than 10]".into());
+        assert_eq!(
+            failure.code.as_deref(),
+            Some("INSTALL_FAILED_VERSION_DOWNGRADE")
+        );
+        assert!(failure.allows_downgrade());
+        assert_eq!(
+            install_failure("Failure [INSTALL_FAILED_INVALID_APK]".into())
+                .code
+                .as_deref(),
+            Some("INSTALL_FAILED_INVALID_APK")
+        );
+        let misleading_path = install_failure("adb: failed to install INSTALL_FAILED_VERSION_DOWNGRADE.apk: Failure [INSTALL_FAILED_INVALID_APK]".into());
+        assert_eq!(
+            misleading_path.code.as_deref(),
+            Some("INSTALL_FAILED_INVALID_APK")
+        );
+        assert!(!misleading_path.allows_downgrade());
+        assert_eq!(install_failure("device offline".into()).code, None);
+    }
+
     /// Runs against the local SDK; prints what the app would show.
     #[test]
     #[ignore = "needs a local Android SDK"]
     fn scan_local() {
-        for d in scan(&Sdk::detect()) {
+        for d in scan(&Sdk::detect(None)) {
             println!("{d:?}");
         }
     }
