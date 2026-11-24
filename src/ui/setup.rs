@@ -2,7 +2,10 @@ use super::*;
 
 impl EmuGrid {
     pub(super) fn empty_grid(&mut self, ui: &mut egui::Ui, actions: &mut Vec<Action>) {
-        let blocked = self.sdk.adb.is_none() && self.sdk.emulator.is_none() && !self.sdk.simctl;
+        let blocked = self.sdk.adb.is_none()
+            && self.sdk.emulator.is_none()
+            && !self.sdk.simctl
+            && self.settings.ios_streams.is_empty();
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.set_min_width(ui.available_width());
             if blocked {
@@ -86,6 +89,19 @@ impl EmuGrid {
                         "simctl not found".into()
                     };
                     environment_row(ui, "iOS", value, self.sdk.simctl);
+                }
+                if !self.settings.ios_streams.is_empty() {
+                    let online = self
+                        .running()
+                        .filter(|d| d.ios_stream_port.is_some())
+                        .count();
+                    let total = self.settings.ios_streams.len();
+                    environment_row(
+                        ui,
+                        "Remote iOS",
+                        format!("{online}/{total} streams online"),
+                        online == total,
+                    );
                 }
             });
     }

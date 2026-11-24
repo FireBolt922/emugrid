@@ -70,7 +70,7 @@ impl EmuGrid {
                 if !rows.is_empty() {
                     any = true;
                     device_group(ui, group, &rows, actions);
-                } else if tab == DeviceTab::Ios && !self.sdk.simctl {
+                } else if tab == DeviceTab::Ios && !self.sdk.simctl && self.settings.ios_streams.is_empty() {
                     any |= self.device_tab == DeviceTab::Ios;
                     let info = if cfg!(target_os = "macos") {
                         "Install Xcode to see iOS simulators here."
@@ -335,7 +335,10 @@ fn row_actions(ui: &mut Ui, d: &Device, actions: &mut Vec<Action>) {
             }
         }
         (State::Running { serial }, _) => {
-            if d.is_emulator && widgets::button(ui, Kind::Ghost, None, "Stop").clicked() {
+            if d.is_emulator
+                && d.ios_stream_port.is_none()
+                && widgets::button(ui, Kind::Ghost, None, "Stop").clicked()
+            {
                 actions.push(d.udid.as_ref().map_or_else(
                     || Action::Stop(serial.clone()),
                     |udid| Action::IosShutdown(udid.clone()),
