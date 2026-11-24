@@ -1,5 +1,6 @@
 //! Small, per-user settings file.
 
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,9 @@ pub struct Settings {
     pub sdk_root: Option<PathBuf>,
     pub tile_width: u32,
     pub sidebar: bool,
+    pub ios_streams: Vec<(u16, String)>,
+    pub ios_controls: BTreeMap<u16, u16>,
+    pub ios_low_latency: bool,
 }
 
 impl Default for Settings {
@@ -18,6 +22,9 @@ impl Default for Settings {
             sdk_root: None,
             tile_width: 200,
             sidebar: true,
+            ios_streams: Vec::new(),
+            ios_controls: BTreeMap::new(),
+            ios_low_latency: false,
         }
     }
 }
@@ -50,6 +57,30 @@ impl Settings {
                         settings.sidebar = show;
                     }
                 }
+                "ios_stream" => {
+                    if let Some((port, name)) = value.split_once(',')
+                        && let Ok(port) = port.trim().parse::<u16>()
+                        && port != 0
+                        && !name.trim().is_empty()
+                        && !settings.ios_streams.iter().any(|(p, _)| *p == port)
+                    {
+                        settings.ios_streams.push((port, name.trim().into()));
+                    }
+                }
+                "ios_control" => {
+                    if let Some((stream, control)) = value.split_once(',')
+                        && let (Ok(stream), Ok(control)) =
+                            (stream.trim().parse(), control.trim().parse())
+                        && stream != 0
+                        && control != 0
+                        && stream != control
+                    {
+                        settings.ios_controls.entry(stream).or_insert(control);
+                    }
+                }
+                "ios_low_latency" => {
+                    settings.ios_low_latency = value.trim() == "true";
+                }
                 _ => {}
             }
         }
@@ -80,6 +111,15 @@ impl Settings {
                 "sdk_root={root}\ntile_width={}\nsidebar={}",
                 self.tile_width, self.sidebar
             )?;
+            for (port, name) in &self.ios_streams {
+                writeln!(file, "ios_stream={port},{name}")?;
+            }
+            for (stream, control) in &self.ios_controls {
+                writeln!(file, "ios_control={stream},{control}")?;
+            }
+            if self.ios_low_latency {
+                writeln!(file, "ios_low_latency=true")?;
+            }
             file.sync_all()?;
             drop(file);
             std::fs::rename(&temp, path)
@@ -126,6 +166,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_named_ios_streams_with_unique_valid_ports() {
+        let settings = Settings::parse(
+            "ios_stream=9111, iPhone 1\nios_stream=9112,iPhone 2\nios_stream=9111,Duplicate\nios_stream=0,Bad\nios_stream=9999, \nios_stream=bad,Invalid",
+        );
+        assert_eq!(
+            settings.ios_streams,
+            [(9111, "iPhone 1".into()), (9112, "iPhone 2".into())]
+        );
+    }
+
+    #[test]
+    fn pairs_ios_control_with_explicit_stream_port() {
+        let settings = Settings::parse(
+            "ios_control=9111,9101\nios_control=9112,9102\nios_control=9111,9123\nios_control=9115,9115\nios_control=9116,0\nios_control=9117,invalid",
+        );
+        assert_eq!(
+            settings.ios_controls,
+            BTreeMap::from([(9111, 9101), (9112, 9102)])
+        );
+    }
+
+    #[test]
     fn round_trips_and_replaces_settings() {
         let dir = std::env::temp_dir().join(format!("emugrid-settings-{}", std::process::id()));
         let path = dir.join("settings.conf");
@@ -134,6 +196,9 @@ mod tests {
             sdk_root: Some("/example path/SDK".into()),
             tile_width: 240,
             sidebar: false,
+            ios_streams: vec![(9111, "iPhone 1".into())],
+            ios_controls: BTreeMap::from([(9111, 9101)]),
+            ios_low_latency: true,
         };
         settings.write(&path).unwrap();
         assert_eq!(

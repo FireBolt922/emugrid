@@ -88,6 +88,8 @@ impl EmuGrid {
         actions: &mut Vec<Action>,
     ) {
         let (badge, tone) = self.status_badge(d);
+        let ios_control = self.ios_control_port(d).is_some();
+        let keyboard = d.platform == Platform::Android || ios_control;
         let p = widgets::pal(ui);
         ui.horizontal(|ui| {
             if widgets::button(ui, Kind::Ghost, Some(Icon::ChevronLeft), "Grid")
@@ -135,22 +137,31 @@ impl EmuGrid {
                     (Icon::Camera, "Screenshot", KeyCommand::Screenshot),
                     actions,
                 );
+                if ios_control {
+                    control_button(
+                        ui,
+                        self,
+                        serial,
+                        (Icon::Home, "Home", KeyCommand::Home),
+                        actions,
+                    );
+                }
                 if !expanded && widgets::button(ui, Kind::Secondary, None, "Details").clicked() {
                     self.lift_finger();
                     self.details_open = !self.details_open;
                 }
-                if d.platform == Platform::Android && width >= 670.0 {
+                if keyboard && width >= 670.0 {
                     widgets::icon(ui, Icon::Keyboard, 14.0, p.accent_text);
                     widgets::status_pill(ui, "Keyboard → device · Esc to release", Tone::Busy);
                 }
             });
         });
-        if width < 520.0 || (d.platform == Platform::Android && width < 670.0) {
+        if width < 520.0 || (keyboard && width < 670.0) {
             ui.horizontal_wrapped(|ui| {
                 if width < 520.0 {
                     widgets::status_pill(ui, &badge, tone);
                 }
-                if d.platform == Platform::Android {
+                if keyboard {
                     widgets::status_pill(ui, "Keyboard → device · Esc to release", Tone::Busy);
                 }
             });
@@ -231,10 +242,12 @@ impl EmuGrid {
     ) {
         let p = widgets::pal(ui);
         let native = self.focused_native_size(serial);
+        let android = d.platform == Platform::Android;
+        let ios_control = self.ios_control_port(d).is_some();
         let height = ui.available_height();
         let action = if let Some(udid) = &d.udid {
             Some(("Shut down", Action::IosShutdown(udid.clone())))
-        } else if d.is_emulator {
+        } else if d.platform == Platform::Android && d.is_emulator {
             Some(("Stop emulator", Action::Stop(serial.into())))
         } else {
             None
@@ -311,7 +324,7 @@ impl EmuGrid {
                             });
                     }
                 });
-                if d.platform == Platform::Android {
+                if android || ios_control {
                     ui.separator();
                     widgets::section_label(ui, "Send text");
                     ui.horizontal(|ui| {
@@ -324,11 +337,11 @@ impl EmuGrid {
                             response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         let send = widgets::button(ui, Kind::Secondary, None, "Send").clicked();
                         if (send || enter) && !self.send_text.is_empty() {
-                            actions.push(Action::Shell(
-                                serial.into(),
-                                format!("input text {}", input::escape_text(&self.send_text)),
+                            actions.push(text_action(
+                                serial,
+                                std::mem::take(&mut self.send_text),
+                                android,
                             ));
-                            self.send_text.clear();
                             if enter {
                                 response.request_focus();
                             }
@@ -337,14 +350,17 @@ impl EmuGrid {
                     ui.small("Or just type with the device focused");
                     ui.separator();
                     widgets::section_label(ui, "Gestures");
-                    for (key, help) in [
-                        ("Click", "Tap"),
-                        ("Drag", "Swipe"),
-                        ("Hold, then drag", "Long press and move"),
-                        ("Right-click", "Long press"),
-                        ("Scroll", "Swipe (pan at 100%)"),
-                        ("Esc", "Return to Grid"),
+                    for (key, help, android_only) in [
+                        ("Click", "Tap", false),
+                        ("Drag", "Swipe", false),
+                        ("Hold, then drag", "Long press and move", true),
+                        ("Right-click", "Long press", false),
+                        ("Scroll", "Swipe (pan at 100%)", true),
+                        ("Esc", "Return to Grid", false),
                     ] {
+                        if android_only && !android {
+                            continue;
+                        }
                         ui.horizontal(|ui| {
                             widgets::kbd(ui, key);
                             ui.label(RichText::new(help).size(11.0).color(p.text2));
@@ -571,6 +587,7 @@ impl EmuGrid {
         let frame_radius = f32::from(theme::RADIUS_PHONE);
         let ppp = ui.ctx().pixels_per_point();
         let android = d.platform == Platform::Android;
+        let ios_control = self.ios_control_port(d).is_some();
         let p = widgets::pal(ui);
         let paint = ui.painter_at(frame.expand(3.0));
         paint.rect_stroke(
@@ -596,7 +613,7 @@ impl EmuGrid {
                 Rect::from_center_size(inner.center(), Vec2::splat(24.0)),
             );
         }
-        let (Some(img), true) = (img, android) else {
+        let (Some(img), true) = (img, android || ios_control) else {
             return;
         };
         let resp = ui.interact(
@@ -604,7 +621,11 @@ impl EmuGrid {
             ui.make_persistent_id("device-screen"),
             Sense::click_and_drag(),
         );
-        self.stage_input(ui, serial, img, &resp, self.zoom != Zoom::Actual, actions);
+        if ios_control {
+            self.stage_ios_input(serial, img, &resp, actions);
+        } else {
+            self.stage_input(ui, serial, img, &resp, self.zoom != Zoom::Actual, actions);
+        }
         if let Some((uv, begun)) = self.ripple {
             if let Some(progress) = ripple_progress(begun.elapsed()) {
                 let at = img.min + uv * img.size();
@@ -617,6 +638,41 @@ impl EmuGrid {
                 self.ripple = None;
             }
         }
+    }
+
+    fn stage_ios_input(
+        &mut self,
+        serial: &str,
+        img: Rect,
+        response: &egui::Response,
+        actions: &mut Vec<Action>,
+    ) {
+        if self.details_open || self.dialog.is_some() {
+            return;
+        }
+        let uv = |point: Pos2| {
+            let position = (point - img.min) / img.size();
+            (position.x, position.y)
+        };
+        use input::{Gesture, wda};
+        let command = match self.gestures.update(response, false) {
+            Some(Gesture::Tap(point)) if img.contains(point) => {
+                self.ripple = Some(((point - img.min) / img.size(), Instant::now()));
+                wda::Gesture::Tap(uv(point))
+            }
+            Some(Gesture::LongPress(point)) if img.contains(point) => wda::Gesture::Hold(uv(point)),
+            Some(Gesture::Swipe(from, to, millis)) if img.contains(from) => {
+                wda::Gesture::Swipe(uv(from), uv(to), millis)
+            }
+            _ => return,
+        };
+        actions.push(Action::IosInput(
+            serial.into(),
+            wda::Command::Touch {
+                gesture: command,
+                landscape: img.width() > img.height(),
+            },
+        ));
     }
 
     fn stage_input(
@@ -776,6 +832,10 @@ impl EmuGrid {
         let android = self
             .device(serial)
             .is_some_and(|d| d.platform == Platform::Android);
+        let ios_control = self
+            .device(serial)
+            .and_then(|d| self.ios_control_port(d))
+            .is_some();
         let events = ctx.input(|i| i.events.clone());
         let mut text = String::new();
         for e in events {
@@ -785,17 +845,15 @@ impl EmuGrid {
                     pressed: true,
                     ..
                 } => actions.push(Action::Unfocus),
-                egui::Event::Text(t) | egui::Event::Paste(t) if android => text.push_str(&t),
+                egui::Event::Text(t) | egui::Event::Paste(t) if android || ios_control => {
+                    text.push_str(&t)
+                }
                 egui::Event::Key {
                     key, pressed: true, ..
                 } if android => {
                     if let Some(code) = input::keycode(key) {
                         if !text.is_empty() {
-                            actions.push(Action::Shell(
-                                serial.into(),
-                                format!("input text {}", input::escape_text(&text)),
-                            ));
-                            text.clear();
+                            actions.push(text_action(serial, std::mem::take(&mut text), true));
                         }
                         actions.push(Action::Shell(
                             serial.into(),
@@ -803,20 +861,42 @@ impl EmuGrid {
                         ));
                     }
                 }
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } if ios_control => {
+                    if let Some(key) = match key {
+                        egui::Key::Backspace => Some('\u{8}'),
+                        egui::Key::Enter => Some('\n'),
+                        _ => None,
+                    } {
+                        text.push(key);
+                    }
+                }
                 _ => {}
             }
         }
         if !text.is_empty() {
-            actions.push(Action::Shell(
-                serial.into(),
-                format!("input text {}", input::escape_text(&text)),
-            ));
+            actions.push(text_action(serial, text, android));
         }
         if android {
             for _ in 0..tabs {
                 actions.push(Action::Shell(serial.into(), "input keyevent 61".into()));
             }
         }
+        if ios_control && tabs > 0 {
+            actions.push(text_action(serial, "\t".repeat(tabs), false));
+        }
+    }
+}
+
+fn text_action(serial: &str, text: String, android: bool) -> Action {
+    if android {
+        Action::Shell(
+            serial.into(),
+            format!("input text {}", input::escape_text(&text)),
+        )
+    } else {
+        Action::IosInput(serial.into(), input::wda::Command::Text(text))
     }
 }
 

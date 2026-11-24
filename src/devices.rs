@@ -1,5 +1,6 @@
 //! Discovering emulators and devices, and starting / stopping them.
 
+use crate::capture::mjpeg;
 use crate::sdk::{Sdk, command};
 use crate::{avd, ios};
 use std::collections::BTreeMap;
@@ -41,6 +42,7 @@ pub struct Device {
     /// AVD name, if this is one of the SDK's AVDs (enables start / cold boot / wipe).
     pub avd: Option<String>,
     pub udid: Option<String>,
+    pub ios_stream_port: Option<u16>,
 }
 
 impl Device {
@@ -76,11 +78,12 @@ fn android(name: String, is_emulator: bool, state: State, avd: Option<String>) -
         state,
         avd,
         udid: None,
+        ios_stream_port: None,
     }
 }
 
 /// One full scan: installed AVDs merged with whatever adb currently sees.
-pub fn scan(sdk: &Sdk) -> Vec<Device> {
+pub fn scan(sdk: &Sdk, ios_streams: &[(u16, String)]) -> Vec<Device> {
     let mut by_name: BTreeMap<String, Device> = BTreeMap::new();
 
     let avd_home = avd::home();
@@ -161,6 +164,27 @@ pub fn scan(sdk: &Sdk) -> Vec<Device> {
     if sdk.simctl {
         list.extend(ios_simulators());
     }
+    list.extend(ios_streams.iter().map(|&(port, ref name)| {
+        let serial = format!("ios-stream:{port}");
+        Device {
+            display_name: name.clone(),
+            api: None,
+            os: None,
+            platform: Platform::Ios,
+            is_emulator: true,
+            state: if mjpeg::available(port) {
+                State::Running { serial }
+            } else {
+                State::Other {
+                    serial,
+                    status: "Stream offline".into(),
+                }
+            },
+            avd: None,
+            udid: None,
+            ios_stream_port: Some(port),
+        }
+    }));
     // Sort by readiness, then name.
     list.sort_by_key(|d| {
         let order = match d.state {
@@ -279,6 +303,7 @@ fn ios_simulators() -> Vec<Device> {
             },
             avd: None,
             udid: Some(s.udid),
+            ios_stream_port: None,
         })
         .collect()
 }
@@ -468,6 +493,12 @@ pub fn save_screenshot(sdk: &Sdk, device: &Device) -> Result<std::path::PathBuf,
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
+    if let Some(port) = device.ios_stream_port {
+        let path = dir.join(format!("emugrid-{safe}-{stamp}.jpg"));
+        let bytes = mjpeg::screenshot(port).map_err(|error| format!("iOS stream: {error}"))?;
+        std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+        return Ok(path);
+    }
     let path = dir.join(format!("emugrid-{safe}-{stamp}.png"));
     match device.platform {
         Platform::Android => {
@@ -550,7 +581,7 @@ mod tests {
     #[test]
     #[ignore = "needs a local Android SDK"]
     fn scan_local() {
-        for d in scan(&Sdk::detect(None)) {
+        for d in scan(&Sdk::detect(None), &[]) {
             println!("{d:?}");
         }
     }

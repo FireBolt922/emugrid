@@ -3,6 +3,7 @@
 use eframe::egui::{Pos2, Response};
 
 pub mod adb;
+pub mod wda;
 
 /// Quote text for `adb shell input text`: spaces become `%s`, and the whole
 /// thing is single-quoted for the device shell.

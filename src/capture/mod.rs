@@ -3,6 +3,7 @@
 
 mod adb_frames;
 pub mod grpc;
+pub mod mjpeg;
 pub mod png;
 pub mod proto;
 
@@ -149,6 +150,8 @@ pub enum Source {
     Adb { adb: PathBuf },
     /// iOS simulator, by UDID.
     Simctl,
+    /// A remote iOS simulator's WebDriverAgent screen on a loopback port.
+    Mjpeg { port: u16 },
 }
 
 /// Owns one worker thread per streamed device.
@@ -275,6 +278,13 @@ fn run(id: &str, source: Source, control: &Control, send: impl Fn(Frame)) {
         }
         Source::Simctl => {
             poll(control, &send, || simctl_screenshot(id), None);
+        }
+        Source::Mjpeg { port } => {
+            while wait_until_active(control) {
+                if mjpeg::stream(port, control, &send).is_err() {
+                    thread::park_timeout(Duration::from_secs(1));
+                }
+            }
         }
     }
 }

@@ -94,6 +94,7 @@ enum Action {
     IosBoot(String),
     IosShutdown(String),
     IosOpen(String),
+    IosInput(String, input::wda::Command),
     Rotate(String),
     Screenshot(String),
     /// `adb shell <cmd>` on a serial, run in order with other input.
@@ -167,6 +168,7 @@ pub struct EmuGrid {
     /// Real screen size per Android serial (`wm size`), for mapping taps.
     screen_sizes: HashMap<String, (u32, u32)>,
     input_workers: HashMap<String, input::adb::Worker>,
+    ios_workers: HashMap<String, input::wda::Worker>,
     /// Tiles drawn on screen this frame; everything else pauses.
     visible: HashSet<String>,
     last_grid_visible: HashSet<String>,
@@ -233,6 +235,7 @@ impl EmuGrid {
             fps_at: Instant::now(),
             screen_sizes: HashMap::new(),
             input_workers: HashMap::new(),
+            ios_workers: HashMap::new(),
             visible: HashSet::new(),
             last_grid_visible: HashSet::new(),
             scroll: (0.0, None),
@@ -252,9 +255,14 @@ impl EmuGrid {
         self.scanning = true;
         self.last_scan = Some(Instant::now());
         let (sdk, tx, ctx) = (self.sdk.clone(), self.tx.clone(), ctx.clone());
+        let ios_streams = self.settings.ios_streams.clone();
         let generation = self.sdk_generation;
         thread::spawn(move || {
-            let _ = tx.send(Msg::Scan(generation, devices::scan(&sdk), grpc::discover()));
+            let _ = tx.send(Msg::Scan(
+                generation,
+                devices::scan(&sdk, &ios_streams),
+                grpc::discover(),
+            ));
             ctx.request_repaint();
         });
     }
@@ -303,7 +311,9 @@ impl EmuGrid {
         for d in &self.devices {
             let Some(serial) = d.serial() else { continue };
             let source = match (d.platform, &self.sdk.adb) {
-                (Platform::Ios, _) => Source::Simctl,
+                (Platform::Ios, _) => d
+                    .ios_stream_port
+                    .map_or(Source::Simctl, |port| Source::Mjpeg { port }),
                 (Platform::Android, Some(adb)) => match self.endpoints.get(serial) {
                     Some(ep) => Source::Grpc {
                         ep: ep.clone(),
@@ -326,6 +336,7 @@ impl EmuGrid {
         }
         self.input_workers
             .retain(|serial, _| alive.contains(serial));
+        self.ios_workers.retain(|serial, _| alive.contains(serial));
     }
 
     /// Look up an Android device's real screen size (for mapping taps) until
@@ -388,6 +399,39 @@ impl EmuGrid {
         }
     }
 
+    fn ios_control_port(&self, device: &Device) -> Option<u16> {
+        self.settings
+            .ios_controls
+            .get(&device.ios_stream_port?)
+            .copied()
+    }
+
+    fn ios_worker(&mut self, ctx: &egui::Context, serial: &str) -> Option<&input::wda::Worker> {
+        let device = self.device(serial)?;
+        let port = self.ios_control_port(device)?;
+        let name = device.display_name.clone();
+        Some(self.ios_workers.entry(serial.into()).or_insert_with(|| {
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            input::wda::Worker::start(port, self.settings.ios_low_latency, move |message| {
+                let _ = tx.send(Msg::InputError(format!("{name} · {message}")));
+                ctx.request_repaint();
+            })
+        }))
+    }
+
+    fn send_ios_input(&mut self, ctx: &egui::Context, serial: &str, command: input::wda::Command) {
+        if let Some(Err(message)) = self
+            .ios_worker(ctx, serial)
+            .map(|worker| worker.send(command))
+        {
+            let name = self
+                .device(serial)
+                .map_or(serial, |device| &device.display_name);
+            self.toasts
+                .push(Notice::Error, format!("{name} · {message}"));
+        }
+    }
+
     /// Name shown for a device; emulators often share a model name, so add
     /// the serial when the name alone is ambiguous.
     fn label(&self, d: &Device) -> String {
@@ -427,6 +471,7 @@ impl EmuGrid {
             self.screens.clear();
             self.fps.clear();
             self.input_workers.clear();
+            self.ios_workers.clear();
             self.screen_sizes.clear();
             self.size_pending.clear();
         }
@@ -450,6 +495,9 @@ impl EmuGrid {
                     .map(|s| Action::Focus(s.into()));
             }
             KeyCommand::Screenshot => return Some(Action::Screenshot(serial.into())),
+            KeyCommand::Home if self.ios_control_port(device).is_some() => {
+                return Some(Action::IosInput(serial.into(), input::wda::Command::Home));
+            }
             _ if device.platform != Platform::Android => return None,
             KeyCommand::Rotate => return device.is_emulator.then(|| Action::Rotate(serial.into())),
             KeyCommand::Back => 4,
@@ -506,6 +554,8 @@ impl EmuGrid {
                     .is_some_and(|d| d.platform == Platform::Android)
                 {
                     self.prepare_input(ctx, &serial);
+                } else {
+                    self.ios_worker(ctx, &serial);
                 }
                 self.focused = Some(serial);
                 self.view = View::Grid;
@@ -639,6 +689,7 @@ impl EmuGrid {
                     self.toasts.push(Notice::Error, e);
                 }
             }
+            Action::IosInput(serial, command) => self.send_ios_input(ctx, &serial, command),
             Action::Rotate(serial) => {
                 self.background(ctx, move |sdk| {
                     devices::rotate(sdk, &serial).map(|_| "Rotated".into())
@@ -822,6 +873,13 @@ impl EmuGrid {
 
     fn status_badge(&self, d: &Device) -> (String, Tone) {
         match &d.state {
+            State::Running { serial } if self.ios_control_port(d).is_some() => {
+                match self.fps(serial) {
+                    Some(fps) if fps > 0 => (format!("LIVE {fps} fps"), Tone::Live),
+                    _ if self.screens.contains_key(serial) => ("LIVE".into(), Tone::Live),
+                    _ => ("STARTING".into(), Tone::Busy),
+                }
+            }
             State::Running { .. } if d.platform == Platform::Ios => {
                 ("VIEW ONLY".into(), Tone::Polled)
             }
@@ -843,6 +901,9 @@ impl EmuGrid {
     }
 
     fn transport(&self, d: &Device) -> &'static str {
+        if d.ios_stream_port.is_some() {
+            return "WebDriverAgent · MJPEG";
+        }
         if d.platform == Platform::Ios {
             return "simctl · view only";
         }
@@ -957,6 +1018,18 @@ impl eframe::App for EmuGrid {
                 Msg::Scan(generation, list, eps) => {
                     if generation == self.sdk_generation {
                         self.on_scan(list, eps);
+                        if self.settings.ios_low_latency {
+                            let unprepared: Vec<_> = self
+                                .running()
+                                .filter(|device| self.ios_control_port(device).is_some())
+                                .filter_map(Device::serial)
+                                .filter(|serial| !self.ios_workers.contains_key(*serial))
+                                .map(str::to_owned)
+                                .collect();
+                            for serial in unprepared {
+                                self.ios_worker(ctx, &serial);
+                            }
+                        }
                     }
                 }
                 Msg::Status(result) => {
@@ -1204,6 +1277,7 @@ mod tests {
                 serial: Some("emulator-5554".into()),
             },
             udid: None,
+            ios_stream_port: None,
         };
         for query in ["", " PIXEL ", "Emulator-5554", "API_35"] {
             assert!(matches_filter(&d, query));
@@ -1227,6 +1301,7 @@ mod tests {
                 avd: Some("Test_AVD".into()),
                 state: State::Stopped,
                 udid: None,
+                ios_stream_port: None,
             }],
             HashMap::new(),
         );
@@ -1312,6 +1387,7 @@ mod tests {
             avd: None,
             os: None,
             udid: None,
+            ios_stream_port: None,
         }];
         let raw = egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0))),
@@ -1330,21 +1406,37 @@ mod tests {
     /// Clicking the middle of the focused screen sends a tap there.
     #[test]
     fn click_on_focused_screen_sends_tap() {
+        check_focused_tap(false);
+    }
+
+    #[test]
+    fn click_on_remote_ios_screen_sends_wda_tap() {
+        check_focused_tap(true);
+    }
+
+    fn check_focused_tap(remote_ios: bool) {
         use egui::{Event, PointerButton, RawInput};
         let ctx = egui::Context::default();
         theme::install(&ctx);
         let mut app = EmuGrid::new(&ctx);
+        let (platform, serial, stream_port) = if remote_ios {
+            app.settings.ios_controls.insert(9111, 9101);
+            (Platform::Ios, "ios-stream:9111", Some(9111))
+        } else {
+            (Platform::Android, "emulator-5554", None)
+        };
         app.devices = vec![Device {
             display_name: "phone".into(),
             api: None,
-            platform: Platform::Android,
+            platform,
             is_emulator: true,
             state: State::Running {
-                serial: "emulator-5554".into(),
+                serial: serial.into(),
             },
             avd: None,
             os: None,
             udid: None,
+            ios_stream_port: stream_port,
         }];
         let tex = ctx.load_texture(
             "s",
@@ -1352,23 +1444,24 @@ mod tests {
             egui::TextureOptions::LINEAR,
         );
         app.screens.insert(
-            "emulator-5554".into(),
+            serial.into(),
             Screen {
                 tex,
                 size: [108, 240],
                 first_pixel: Color32::BLACK,
             },
         );
-        app.screen_sizes
-            .insert("emulator-5554".into(), (1080, 2400));
-        app.focused = Some("emulator-5554".into());
+        if !remote_ios {
+            app.screen_sizes.insert(serial.into(), (1080, 2400));
+        }
+        app.focused = Some(serial.into());
 
         let raw = RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 700.0))),
             ..Default::default()
         };
         let mut frame = ctx.run_ui(raw, |ui| {
-            app.focused_view(ui, "emulator-5554", &mut Vec::new());
+            app.focused_view(ui, serial, &mut Vec::new());
         });
         let center = frame
             .shapes
@@ -1415,25 +1508,29 @@ mod tests {
             };
             let mut out = ctx.run_ui(raw, |ui| {
                 let mut actions = Vec::new();
-                app.focused_view(ui, "emulator-5554", &mut actions);
+                app.focused_view(ui, serial, &mut actions);
                 for a in actions {
-                    match a {
-                        Action::Shell(_, cmd) => sent.push((Vec::new(), cmd)),
-                        Action::Touch(_, steps, fallback) => sent.push((steps, fallback)),
-                        _ => {}
+                    if matches!(
+                        a,
+                        Action::Shell(..) | Action::Touch(..) | Action::IosInput(..)
+                    ) {
+                        sent.push(a);
                     }
                 }
             });
             out.textures_delta.clear();
         }
-        assert_eq!(sent.len(), 1, "{sent:?}");
-        let (steps, fallback) = &sent[0];
-        // A finger down and up at the middle of the screen, or `input tap`
-        // on devices without the virtual touchscreen.
+        let at_center = |u: f32, v: f32| (u - 0.5).abs() < 0.05 && (v - 0.5).abs() < 0.05;
+        if remote_ios {
+            assert!(
+                matches!(sent.as_slice(), [Action::IosInput(id, input::wda::Command::Touch { gesture: input::wda::Gesture::Tap((u, v)), landscape: false })] if id == serial && at_center(*u, *v))
+            );
+            return;
+        }
         assert!(
-            matches!(steps[..], [Touch::Down(u, v), Touch::Up] if (u - 0.5).abs() < 0.05 && (v - 0.5).abs() < 0.05),
-            "{sent:?}"
+            matches!(sent.as_slice(), [Action::Touch(id, steps, fallback)]
+                if id == serial && fallback.starts_with("input tap ")
+                && matches!(steps.as_slice(), [Touch::Down(u, v), Touch::Up] if at_center(*u, *v)))
         );
-        assert!(fallback.starts_with("input tap "), "{sent:?}");
     }
 }

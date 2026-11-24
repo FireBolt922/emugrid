@@ -3,7 +3,7 @@
 **See and control all your Android emulators — and iOS simulators — in one window.**
 A tiny, fast, cross-platform desktop app written in Rust. Under 8 MB, no Electron, no browser engine.
 
-> Live previews, Android device controls, and view-only iOS simulators.
+> Live previews and controls for Android devices and remote iOS simulators.
 > See the [roadmap](docs/ROADMAP.md).
 
 ## Why
@@ -65,6 +65,43 @@ Use **Cmd** on macOS and **Ctrl** on Linux and Windows to trigger these shortcut
   and select **Use**. **Check again** reruns detection and refreshes the device list.
 - Optional, macOS: Xcode for iOS simulators. iOS simulators are view-only
   (`simctl` cannot send touches); use **Open in Simulator** to interact.
+
+### Remote iOS simulators
+
+Forward the WebDriverAgent control and live-screen ports from your Mac to
+loopback. This example connects two simulators:
+
+```bash
+ssh -f -N -o ExitOnForwardFailure=yes \
+  -L 127.0.0.1:9101:127.0.0.1:9101 \
+  -L 127.0.0.1:9102:127.0.0.1:9102 \
+  -L 127.0.0.1:9111:127.0.0.1:9111 \
+  -L 127.0.0.1:9112:127.0.0.1:9112 mac-office
+```
+
+With EmuGrid closed, add one `ios_stream=port,name` per simulator to its
+`settings.conf` (`~/.config/emugrid/` on Linux, `~/Library/Application Support/emugrid/`
+on macOS, or `%APPDATA%\emugrid\` on Windows). Pair a screen with a control
+port using `ios_control=stream_port,control_port`.
+
+```ini
+ios_stream=9111,iPhone 1
+ios_stream=9112,iPhone 2
+ios_control=9111,9101
+ios_control=9112,9102
+```
+
+Open EmuGrid to see the remote simulators in the Grid. The List shows configured
+streams even when they are offline. Open a simulator to tap, drag to swipe,
+right-click to long-press, type into focused fields, or press Home. Omit
+`ios_control` for a view-only stream. Screenshots are saved as JPEGs at the
+stream resolution. Manage simulator startup on the Mac and reopen the SSH tunnel
+after a reboot or disconnect.
+
+For simulators dedicated to interactive use, add `ios_low_latency=true` to
+`settings.conf`. EmuGrid lowers the stream resolution to 50%, requests up to
+30 FPS, and disables WebDriverAgent's idle and animation waits for the active
+session. Automation sharing that session also sees those settings.
 
 ## Download
 
